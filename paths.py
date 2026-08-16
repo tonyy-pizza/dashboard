@@ -26,3 +26,15 @@ JOURNAL_PATH = DOOMNOTES_DIR / "journal.org"
 # Optional home for the secret iCal address, as an alternative to pasting it
 # into calendar_feed.py. Gitignored, so the URL can't be committed by accident.
 ICAL_URL_PATH = DATA_DIR / "calendar_url.txt"
+
+# ── Google ↔ Outlook two-way sync (calendar_sync.py) ─────────────────
+# Standalone from the dashboard; its own credentials, all gitignored. The
+# Google set here is read/write and separate from the panel's ICS feed.
+GOOGLE_SYNC_CREDENTIALS_PATH = DATA_DIR / "gcal_sync_credentials.json"
+GOOGLE_SYNC_TOKEN_PATH = DATA_DIR / "gcal_sync_token.json"
+GRAPH_APP_PATH = DATA_DIR / "graph_app.json"          # client_id + tenant_id
+GRAPH_TOKEN_CACHE_PATH = DATA_DIR / "graph_token_cache.json"
+
+# Written by every sync run; the Calendar panel reads the status file.
+SYNC_STATUS_PATH = DATA_DIR / "calendar_sync_status.json"
+SYNC_LOG_PATH = DATA_DIR / "calendar_sync.log"

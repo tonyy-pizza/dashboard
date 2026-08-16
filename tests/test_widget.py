@@ -466,6 +466,93 @@ print("STATUS:" + window.journal_status._full_text)
     assert "pip install orgparse" in result.stdout
 
 
+# ── calendar sync status ─────────────────────────────────────────────
+
+def write_sync_status(**fields):
+    status = {"last_run_utc": None, "last_success_utc": None, "last_error": None,
+              "events_synced_count": 0, "dry_run": False}
+    status.update(fields)
+    dw.SYNC_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    dw.SYNC_STATUS_PATH.write_text(json.dumps(status), encoding="utf-8")
+
+
+def minutes_ago(count):
+    moment = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=count)
+    return moment.replace(microsecond=0).isoformat()
+
+
+def test_a_recent_sync_shows_how_long_ago(widget):
+    write_sync_status(last_run_utc=minutes_ago(4),
+                      last_success_utc=minutes_ago(4), events_synced_count=3)
+
+    widget._load_sync_status()
+
+    assert widget.sync_label.text() == "synced 4m ago"
+    assert "3 event" in widget.sync_label.toolTip()
+
+
+def test_a_failed_sync_is_called_out(widget):
+    write_sync_status(last_run_utc=minutes_ago(2),
+                      last_success_utc=minutes_ago(90),
+                      last_error="Graph GET 503: service unavailable")
+
+    widget._load_sync_status()
+
+    text = widget.sync_label.text()
+    assert text.startswith("sync failed 2m ago")
+    assert "last ok 1h ago" in text
+    assert "503" in widget.sync_label.toolTip()
+
+
+def test_a_dry_run_is_labelled_as_one(widget):
+    write_sync_status(last_run_utc=minutes_ago(3),
+                      last_success_utc=minutes_ago(3), dry_run=True)
+
+    widget._load_sync_status()
+
+    assert widget.sync_label.text() == "synced 3m ago (dry run)"
+
+
+def test_no_status_file_means_no_sync_line(widget):
+    if dw.SYNC_STATUS_PATH.exists():
+        dw.SYNC_STATUS_PATH.unlink()
+
+    widget._load_sync_status()
+
+    assert widget.sync_label.text() == ""
+
+
+def test_a_corrupt_status_file_is_ignored(widget):
+    dw.SYNC_STATUS_PATH.write_text("{not json", encoding="utf-8")
+
+    widget._load_sync_status()
+
+    assert widget.sync_label.text() == ""
+
+
+def test_the_status_file_is_watched_like_the_cache(widget):
+    write_sync_status(last_run_utc=minutes_ago(3), last_success_utc=minutes_ago(3))
+
+    widget._on_watched_change(str(dw.SYNC_STATUS_PATH))
+
+    assert widget.sync_label.text() == "synced 3m ago"
+    assert str(dw.SYNC_STATUS_PATH) in widget.watcher.files()
+
+
+@pytest.mark.parametrize("seconds,expected", [
+    (5, "5s ago"), (89, "89s ago"), (120, "2m ago"),
+    (5399, "89m ago"), (7200, "2h ago"), (172801, "2d ago"),
+])
+def test_relative_times_read_naturally(seconds, expected):
+    moment = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=seconds)
+    assert dw._ago(moment.isoformat()) == expected
+
+
+def test_a_clock_skewed_future_timestamp_does_not_read_as_negative():
+    ahead = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).isoformat()
+    assert dw._ago(ahead) == "just now"
+
+
 # ── rough notes ──────────────────────────────────────────────────────
 
 def test_rough_notes_save_and_reload(widget):

@@ -60,6 +60,86 @@ Recurring events, cancelled occurrences and multi-day all-day events are all
 handled — `recurring-ical-events` expands the RRULEs for the week being
 displayed.
 
+## Google ↔ Outlook two-way sync (`calendar_sync.py`)
+
+Standalone from the dashboard. The Calendar panel above *reads* an ICS feed
+for display; this script *writes* to both calendars, so it has its own
+credentials, its own schedule, and its own log.
+
+```
+py -m pip install msal google-api-python-client google-auth-oauthlib
+
+py calendar_sync.py --auth-google      # one browser sign-in
+py calendar_sync.py --auth-outlook     # one device code
+py calendar_sync.py --dry-run          # ← always do this first
+py calendar_sync.py                    # for real
+```
+
+**What it does.** Primary calendar on each side. A rolling window of 7 days
+back to 120 days forward, recomputed every run; anything outside it is left
+alone entirely. Creates and edits propagate both ways. Edited on both sides
+since the last run → the most recent edit wins, compared on Graph's
+`lastModifiedDateTime` against Google's `updated`.
+
+**What it deliberately doesn't do.**
+
+- **Deletions never propagate.** Delete an event and its mirror stays put for
+  you to remove by hand. A sync bug that deletes real calendar entries is
+  worse than a stale copy.
+- **Attendees are mirrored as text in the description, not as real
+  attendees.** Everything travels — names, addresses, subject, description,
+  location — but a mirrored copy never sends its own invitations. Without
+  this, every work meeting would re-invite clients from your personal Gmail
+  and every personal event would invite people from the work account.
+- **Recurring events are synced as individual occurrences**, since both APIs
+  expand them for us (`calendarView` on Graph, `singleEvents=True` on
+  Google). Consequence: "this and all future events" isn't a single edit
+  here — each affected occurrence updates itself on the next run instead.
+
+**Setup — Microsoft.** You have Global Admin, so this is self-service:
+
+1. portal.azure.com → Microsoft Entra ID → App registrations → New registration
+2. Accounts in this organizational directory only; no redirect URI
+3. Authentication → Advanced → **Allow public client flows: Yes**
+4. API permissions → Microsoft Graph → Delegated → **Calendars.ReadWrite**
+5. API permissions → **Grant admin consent for Agrotek**
+6. Overview → put the ids in `graph_app.json`:
+   `{"client_id": "…", "tenant_id": "…"}`
+7. `py calendar_sync.py --auth-outlook` and enter the code it prints
+
+It's a public client, so there is no client secret to store anywhere. The
+refresh token is cached in `graph_token_cache.json` for unattended runs.
+
+**Setup — Google.** A separate OAuth client from anything else here, because
+this needs the read/write `calendar` scope: enable the Calendar API, create a
+**Desktop app** OAuth client, save it as `gcal_sync_credentials.json`, then
+`py calendar_sync.py --auth-google`.
+
+**First run.** Nothing is tagged yet, so a plain first run would create a
+second copy of every event already sitting in both calendars. Two options:
+
+- `--dry-run` first, always — read the log, then decide.
+- `--reconcile` on the first real run links events that already exist on both
+  sides (identical title, identical start, unambiguous 1:1) instead of
+  duplicating them. Ambiguous matches are skipped rather than guessed at.
+
+**Scheduling.** Task Scheduler on joputer, every 10 minutes:
+
+```
+schtasks /create /tn "Calendar sync" /sc minute /mo 10 ^
+  /tr "py C:\Users\joey\dashboard-project-files\calendar_sync.py"
+```
+
+Polling only — nothing listens on a port, nothing is exposed to the internet.
+
+**Output.** `calendar_sync.log` gets one timestamped line per action
+(created / updated / linked / failed, with the reason). `calendar_sync_status.json`
+carries `last_run_utc`, `last_success_utc`, `last_error` and
+`events_synced_count`; the dashboard's Calendar panel shows a
+"synced 4m ago" line from it, picked up by the same `QFileSystemWatcher` as
+everything else. A failed run keeps the previous `last_success_utc`, so the
+panel can show both.
+
 ## Files
 
 | File | Owner | Notes |
@@ -70,6 +150,10 @@ displayed.
 | `journal.org` | widget **and Emacs** | org datetree in `doomnotes/`, stays hand-editable |
 | `rough_notes.txt` | widget | freeform scratch panel, autosaved |
 | `calendar_url.txt` | you | optional home for the secret iCal URL, gitignored |
+| `gcal_sync_credentials.json` / `gcal_sync_token.json` | you / Google | sync OAuth, read-write scope, gitignored |
+| `graph_app.json` / `graph_token_cache.json` | you / Microsoft | sync app ids + token cache, gitignored |
+| `calendar_sync_status.json` | calendar_sync | last run, last success, error, count |
+| `calendar_sync.log` | calendar_sync | one line per action |
 
 ### journal.org
 
@@ -149,10 +233,13 @@ all three profiles after reboot, scripts are invoked with `py` (not
 python -m pytest
 ```
 
-125 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
+221 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
 They cover the org datetree round-trip, the JSON stores, iCal parsing
-(recurrence, all-day spans, timezones) and the widget's wiring — panels build,
-clicks reach the right file, and a `cache.json` renders without blowing up.
+(recurrence, all-day spans, timezones), the sync engine (loop prevention,
+conflict resolution, dry runs, first-run reconciliation) and the widget's
+wiring — panels build, clicks reach the right file, and a `cache.json`
+renders without blowing up. The sync tests use fake calendar sides, so they
+never touch a real account.
 
 ## Refresh behaviour
 

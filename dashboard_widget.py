@@ -56,8 +56,10 @@ from PyQt6.QtWidgets import (
 import theme
 from habit_store import HabitStore, year_dates
 from journal_store import JournalStore, JournalUnavailable
-from paths import COLLECTOR_SCRIPT, CACHE_PATH, ROUGH_NOTES_PATH
-from storage import atomic_write_text
+from paths import (
+    CACHE_PATH, COLLECTOR_SCRIPT, ROUGH_NOTES_PATH, SYNC_STATUS_PATH,
+)
+from storage import atomic_write_text, load_json
 from theme import (
     BG, BORDER, CHROME, CREAM, CREAM_DIM, DONE_TEXT, DOT_EMPTY, FAINT, HOVER,
     PANEL_BG, WHITE,
@@ -136,6 +138,26 @@ def clear_layout(layout):
             widget.deleteLater()
         elif item.layout():
             clear_layout(item.layout())
+
+
+def _ago(iso_str):
+    """'2026-08-16T18:40:00+00:00' → '4m ago'. None when unparseable."""
+    if not iso_str:
+        return None
+    try:
+        when = dt.datetime.fromisoformat(str(iso_str))
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    seconds = (dt.datetime.now(dt.timezone.utc) - when).total_seconds()
+    if seconds < 0:
+        return "just now"
+    for limit, size, unit in ((90, 1, "s"), (5400, 60, "m"),
+                              (172800, 3600, "h")):
+        if seconds < limit:
+            return f"{int(seconds // size)}{unit} ago"
+    return f"{int(seconds // 86400)}d ago"
 
 
 def _sync_stamp(iso_str):
@@ -1239,6 +1261,7 @@ class DashboardWidget(QWidget):
         self._build_ui()
         self._setup_watcher()
         self._load_cache()
+        self._load_sync_status()
         self._reload_todos()
         self._reload_habits()
         self._reload_journal()
@@ -1795,14 +1818,52 @@ class DashboardWidget(QWidget):
 
     # ── panel: calendar ──────────────────────────────────────────────
     def _build_calendar_panel(self):
-        box, layout, caption, _ = self._panel("calendar", "")
+        box, layout, caption, header = self._panel("calendar", "")
         self.calendar_caption = caption
+        # Two-way sync status, written by calendar_sync.py on every run.
+        self.sync_label = QLabel("")
+        self.sync_label.setStyleSheet(f"color: {FAINT}; background: transparent;")
+        self.scaler.font(self.body_font, theme.CAPTION_PX, register=self.sync_label)
+        header.addWidget(self.sync_label)
+
         self.calendar_hint = self._hint("", size=theme.SMALL_PX)
         self.calendar_hint.hide()
         layout.addWidget(self.calendar_hint)
         self.week_grid = WeekGrid(self.scaler, self.body_font, self.title_font)
         layout.addWidget(self.week_grid, 1)
         return box
+
+    def _load_sync_status(self):
+        """'synced 4m ago' from calendar_sync_status.json. Absent file means
+        the sync isn't set up, and the line simply stays empty."""
+        if not SYNC_STATUS_PATH.exists():
+            self.sync_label.setText("")
+            return
+        status = load_json(SYNC_STATUS_PATH, {})
+        if not isinstance(status, dict) or not status:
+            self.sync_label.setText("")
+            return
+
+        succeeded = _ago(status.get("last_success_utc"))
+        error = status.get("last_error")
+        if error:
+            attempted = _ago(status.get("last_run_utc")) or "just now"
+            text = f"sync failed {attempted}"
+            if succeeded:
+                text += f" · last ok {succeeded}"
+            self.sync_label.setStyleSheet(f"color: {CHROME}; background: transparent;")
+            self.sync_label.setToolTip(str(error))
+        elif succeeded:
+            text = f"synced {succeeded}"
+            if status.get("dry_run"):
+                text += " (dry run)"
+            self.sync_label.setStyleSheet(f"color: {FAINT}; background: transparent;")
+            self.sync_label.setToolTip(
+                f"{status.get('events_synced_count', 0)} event(s) written last run")
+        else:
+            text = "sync pending"
+            self.sync_label.setToolTip("")
+        self.sync_label.setText(text)
 
     def _render_calendar(self, data):
         data = data or {}
@@ -1992,20 +2053,26 @@ class DashboardWidget(QWidget):
 
     # ── file watching (no polling) ───────────────────────────────────
     def _setup_watcher(self):
+        # Two watched files, same zero-polling pattern: cache.json from the
+        # collector, and the status file calendar_sync.py writes each run.
         self.watcher = QFileSystemWatcher()
-        if CACHE_PATH.exists():
-            self.watcher.addPath(str(CACHE_PATH))
-        else:
-            CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            self.watcher.addPath(str(CACHE_PATH.parent))
-        self.watcher.fileChanged.connect(self._on_cache_changed)
-        self.watcher.directoryChanged.connect(self._on_cache_changed)
+        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.watcher.addPath(str(CACHE_PATH.parent))
+        for path in (CACHE_PATH, SYNC_STATUS_PATH):
+            if path.exists():
+                self.watcher.addPath(str(path))
+        self.watcher.fileChanged.connect(self._on_watched_change)
+        self.watcher.directoryChanged.connect(self._on_watched_change)
 
-    def _on_cache_changed(self, _path):
-        # Atomic replace drops the old inode, so re-arm the watch on the path.
-        if CACHE_PATH.exists() and str(CACHE_PATH) not in self.watcher.files():
-            self.watcher.addPath(str(CACHE_PATH))
+    def _on_watched_change(self, _path):
+        # An atomic replace drops the old inode, so re-arm the watch on any
+        # path that came back.
+        watched = set(self.watcher.files())
+        for path in (CACHE_PATH, SYNC_STATUS_PATH):
+            if path.exists() and str(path) not in watched:
+                self.watcher.addPath(str(path))
         self._load_cache()
+        self._load_sync_status()
 
     # ── cache loading (read-only panels) ─────────────────────────────
     def _load_cache(self):

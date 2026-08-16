@@ -16,3 +16,11 @@ rough_notes.txt
 calendar_url.txt
 credentials.json
 token.json
+
+# calendar_sync.py credentials and output
+gcal_sync_credentials.json
+gcal_sync_token.json
+graph_app.json
+graph_token_cache.json
+calendar_sync_status.json
+calendar_sync.log
