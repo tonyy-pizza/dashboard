@@ -103,6 +103,27 @@ def soft_wrap(text):
     return re.sub(r"([./,()'=:])", "\\1" + "​", str(text))
 
 
+def make_check_box(size=13):
+    """The dashboard's own check indicator — a hard-cornered square that
+    fills cream when set. Returns (frame, fill); pass both to set_check_box.
+    Native QCheckBox brings its own platform chrome, which fights the skin."""
+    box = QFrame()
+    box.setFixedSize(size, size)
+    box.setCursor(Qt.CursorShape.PointingHandCursor)
+    layout = QHBoxLayout(box)
+    layout.setContentsMargins(3, 3, 3, 3)
+    fill = QFrame()
+    layout.addWidget(fill)
+    return box, fill
+
+
+def set_check_box(box, fill, checked):
+    fill.setVisible(checked)
+    fill.setStyleSheet(f"background: {CREAM}; border: none;")
+    box.setStyleSheet(f"border: 1px solid {CHROME if checked else BORDER}; "
+                      f"background: transparent;")
+
+
 def clear_layout(layout):
     while layout.count():
         item = layout.takeAt(0)
@@ -600,13 +621,7 @@ class TodoRow(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        self.box = QFrame()
-        self.box.setFixedSize(13, 13)
-        self.box.setCursor(Qt.CursorShape.PointingHandCursor)
-        box_layout = QHBoxLayout(self.box)
-        box_layout.setContentsMargins(3, 3, 3, 3)
-        self.fill = QFrame()
-        box_layout.addWidget(self.fill)
+        self.box, self.fill = make_check_box()
         layout.addWidget(self.box, 0, Qt.AlignmentFlag.AlignTop)
 
         self.label = QLabel(item.text)
@@ -642,10 +657,7 @@ class TodoRow(QWidget):
 
     def _apply_state(self):
         done = self.item.done
-        self.fill.setVisible(done)
-        self.fill.setStyleSheet(f"background: {CREAM}; border: none;")
-        self.box.setStyleSheet(
-            f"border: 1px solid {CHROME if done else BORDER}; background: transparent;")
+        set_check_box(self.box, self.fill, done)
         font = self.label.font()
         font.setStrikeOut(done)
         self.label.setFont(font)
@@ -693,6 +705,45 @@ class TodoRow(QWidget):
         menu.addSeparator()
         menu.addAction("delete", lambda: self.deleted.emit(self.item.id))
         menu.exec(event.globalPos())
+
+
+class TodayCheck(QWidget):
+    """`[✓] today` — the one-click way to log a habit for the current day.
+
+    Same thing as clicking today's dot in the year grid, without having to
+    find it. Both stay in sync because a toggle rebuilds the whole panel.
+    """
+
+    clicked = pyqtSignal()
+
+    def __init__(self, scaler, body_family, date, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(f"log this habit for today ({date.isoformat()})")
+        self.setStyleSheet("background: transparent;")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.box, self.fill = make_check_box()
+        layout.addWidget(self.box)
+
+        self.label = QLabel("today")
+        scaler.font(body_family, theme.CAPTION_PX, register=self.label)
+        layout.addWidget(self.label)
+        self.set_checked(False)
+
+    def set_checked(self, checked):
+        set_check_box(self.box, self.fill, checked)
+        self.label.setStyleSheet(
+            f"color: {CREAM if checked else FAINT}; background: transparent;")
+
+    def mousePressEvent(self, event):
+        # The label counts as part of the target — a 13px box is a small
+        # thing to ask someone to hit every morning.
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
 
 
 class TierList(QWidget):
@@ -1521,6 +1572,13 @@ class DashboardWidget(QWidget):
             self.scaler.font(self.body_font, theme.SMALL_PX, register=goal)
             header.addWidget(goal, 1)
         header.addStretch()
+
+        today = dt.date.today()
+        check = TodayCheck(self.scaler, self.body_font, today)
+        check.set_checked(habit.is_done(today))
+        check.clicked.connect(
+            lambda h=habit, d=today: self._toggle_habit_day(h.id, d))
+        header.addWidget(check)
 
         count = QLabel(f"{habit.done_count(year)} days")
         count.setStyleSheet(f"color: {CHROME}; background: transparent;")

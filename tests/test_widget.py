@@ -184,6 +184,62 @@ def test_clicking_a_day_writes_habits_json(widget):
     assert widget.habits.load()[0].is_done(day) is False
 
 
+def test_today_checkbox_logs_the_habit(widget):
+    widget.habits.add("lift")
+    widget._reload_habits()
+    today = dt.date.today()
+
+    check = widget.findChildren(dw.TodayCheck)[0]
+    assert check.fill.isVisibleTo(check) is False
+    check.clicked.emit()
+
+    assert widget.habits.load()[0].is_done(today) is True
+    # The panel rebuilt, so grab the new one and confirm it came back ticked.
+    check = widget.findChildren(dw.TodayCheck)[0]
+    assert check.fill.isVisibleTo(check) is True
+
+
+def test_today_checkbox_unlogs_on_a_second_click(widget):
+    widget.habits.add("lift")
+    habit_id = widget.habits.load()[0].id
+    widget.habits.set_day(habit_id, dt.date.today(), True)
+    widget._reload_habits()
+
+    widget.findChildren(dw.TodayCheck)[0].clicked.emit()
+
+    assert widget.habits.load()[0].is_done(dt.date.today()) is False
+
+
+def test_today_checkbox_and_grid_stay_in_sync(widget):
+    widget.habits.add("lift")
+    widget._reload_habits()
+    habit_id = widget.habits.load()[0].id
+    today = dt.date.today()
+
+    # Log via the grid; the checkbox should show it after the rebuild.
+    widget._toggle_habit_day(habit_id, today)
+
+    check = widget.findChildren(dw.TodayCheck)[0]
+    grid = widget.findChildren(dw.DotGrid)[0]
+    assert check.fill.isVisibleTo(check) is True
+    assert grid._values.get(today) == 1.0
+
+
+def test_each_habit_gets_its_own_today_checkbox(widget):
+    widget.habits.add("lift")
+    widget.habits.add("read")
+    widget._reload_habits()
+    lift_id = widget.habits.load()[0].id
+
+    checks = widget.findChildren(dw.TodayCheck)
+    assert len(checks) == 2
+    checks[0].clicked.emit()
+
+    by_id = {h.id: h for h in widget.habits.load()}
+    assert by_id[lift_id].is_done(dt.date.today()) is True
+    assert sum(h.is_done(dt.date.today()) for h in widget.habits.load()) == 1
+
+
 def test_archiving_removes_the_grid_but_keeps_the_habit(widget):
     widget.habits.add("lift")
     widget._reload_habits()

@@ -88,7 +88,7 @@ properties and sub-headings under a day survive untouched.
 | today's items | Weather | Open-Meteo, current + H/L + hourly sparkline |
 | today's items | Calendar | Google Calendar, this week, read-only |
 | today's items | To Do | `todo.json` — add, complete, delete, drag within a tier |
-| today's items | Habit Tracker | `habits.json` — click any day in the year grid |
+| today's items | Habit Tracker | `habits.json` — `[✓] today` per habit, or click any day in the year grid to backfill |
 | today's items | Journal | `journal.org` — one entry/day, rating 1.0–10.0 |
 | at a glance | Greed Index | CNN Fear & Greed |
 | at a glance | Sector Analysis | S&P 500 + TSX sector ETFs, 1-day change |
@@ -136,7 +136,7 @@ all three profiles after reboot, scripts are invoked with `py` (not
 python -m pytest
 ```
 
-102 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
+106 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
 They cover the org datetree round-trip, the JSON stores, the calendar shaping
 and the widget's wiring — panels build, clicks reach the right file, and a
 `cache.json` renders without blowing up.
