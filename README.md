@@ -22,9 +22,14 @@ panels are gone, and so is the News RSS panel.
 ## Setup
 
 ```
-pip install PyQt6 orgparse yfinance requests
-pip install google-api-python-client google-auth-oauthlib    # calendar only
+py -m pip install PyQt6 orgparse yfinance requests
+py -m pip install google-api-python-client google-auth-oauthlib   # calendar only
 ```
+
+`orgparse` is the only dependency the old dashboard didn't have — it's what
+reads and writes the journal datetree. If it's missing the journal panel
+disables itself with the install command and the rest of the dashboard still
+starts; the Google libraries are optional in the same way.
 
 Paths live in `paths.py`. They default to the real joputer locations and can
 be pointed elsewhere with `DASHBOARD_DATA_DIR` / `DASHBOARD_NOTES_DIR` (that's
@@ -136,7 +141,7 @@ all three profiles after reboot, scripts are invoked with `py` (not
 python -m pytest
 ```
 
-106 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
+109 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
 They cover the org datetree round-trip, the JSON stores, the calendar shaping
 and the widget's wiring — panels build, clicks reach the right file, and a
 `cache.json` renders without blowing up.

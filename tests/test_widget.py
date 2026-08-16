@@ -7,6 +7,7 @@ into the read-only panels without blowing up.
 
 import datetime as dt
 import json
+from pathlib import Path
 
 import pytest
 from PyQt6.QtCore import QPointF, QSize
@@ -429,6 +430,40 @@ def test_missing_cache_is_not_fatal(widget):
         dw.CACHE_PATH.unlink()
     widget._load_cache()
     assert "no cache file yet" in widget.status_label._full_text
+
+
+# ── missing orgparse ─────────────────────────────────────────────────
+
+def test_the_window_still_launches_without_orgparse(tmp_path):
+    """The whole app used to die at import with ModuleNotFoundError. Now the
+    journal panel disables itself and everything else comes up."""
+    import os
+    import subprocess
+    import sys
+
+    repo = str(Path(__file__).resolve().parent.parent)
+    script = f'''
+import sys
+sys.modules["orgparse"] = None      # makes `import orgparse` raise ImportError
+sys.path.insert(0, {repo!r})
+from PyQt6.QtWidgets import QApplication
+import dashboard_widget as dw
+app = QApplication([])
+window = dw.DashboardWidget()
+assert window.journal_save_btn.isEnabled() is False, "save button should be off"
+assert window.journal_history_btn.isEnabled() is False, "history should be off"
+assert window.todo_input.isEnabled() is True, "the rest must still work"
+print("STATUS:" + window.journal_status._full_text)
+'''
+    env = {**os.environ,
+           "QT_QPA_PLATFORM": "offscreen",
+           "DASHBOARD_DATA_DIR": str(tmp_path / "data"),
+           "DASHBOARD_NOTES_DIR": str(tmp_path / "notes")}
+    result = subprocess.run([sys.executable, "-c", script], env=env,
+                            capture_output=True, text=True, timeout=120)
+
+    assert result.returncode == 0, result.stderr
+    assert "pip install orgparse" in result.stdout
 
 
 # ── rough notes ──────────────────────────────────────────────────────

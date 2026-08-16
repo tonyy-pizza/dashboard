@@ -326,3 +326,24 @@ def test_bad_ratings_are_rejected(store, bad):
 def test_good_ratings_are_accepted(store, good, expected):
     store.write_entry(dt.date(2026, 8, 16), good, "body")
     assert store.read_entry(dt.date(2026, 8, 16)).rating == expected
+
+
+# ── missing dependency ───────────────────────────────────────────────
+
+def test_without_orgparse_reads_and_writes_raise_a_clear_error(store, monkeypatch):
+    import journal_store
+    monkeypatch.setattr(journal_store, "orgparse", None)
+
+    with pytest.raises(journal_store.JournalUnavailable, match="pip install orgparse"):
+        store.read_entry(dt.date(2026, 8, 16))
+    with pytest.raises(journal_store.JournalUnavailable, match="pip install orgparse"):
+        store.write_entry(dt.date(2026, 8, 16), 7.0, "body")
+
+
+def test_a_bad_rating_is_still_a_value_error(store):
+    """JournalUnavailable is about setup; a bad rating is not."""
+    import journal_store
+
+    with pytest.raises(ValueError) as caught:
+        store.write_entry(dt.date(2026, 8, 16), 99, "body")
+    assert not isinstance(caught.value, journal_store.JournalUnavailable)

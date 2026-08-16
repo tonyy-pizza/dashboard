@@ -55,7 +55,7 @@ from PyQt6.QtWidgets import (
 
 import theme
 from habit_store import HabitStore, year_dates
-from journal_store import JournalStore
+from journal_store import JournalStore, JournalUnavailable
 from paths import COLLECTOR_SCRIPT, CACHE_PATH, ROUGH_NOTES_PATH
 from storage import atomic_write_text
 from theme import (
@@ -1628,7 +1628,8 @@ class DashboardWidget(QWidget):
         box, layout, caption, header = self._panel(
             "journal", f"{DAYS_SHORT[today.weekday()]} {today.isoformat()}")
         self.journal_caption = caption
-        header.addWidget(self._small_button("history", self._show_journal_history))
+        self.journal_history_btn = self._small_button("history", self._show_journal_history)
+        header.addWidget(self.journal_history_btn)
 
         self.journal_body = QPlainTextEdit()
         self.journal_body.setPlaceholderText("how did today go?")
@@ -1672,7 +1673,8 @@ class DashboardWidget(QWidget):
         self.scaler.font(self.body_font, theme.CAPTION_PX, register=self.journal_status)
         controls.addWidget(self.journal_status, 1)
 
-        controls.addWidget(self._small_button("save entry", self._save_journal))
+        self.journal_save_btn = self._small_button("save entry", self._save_journal)
+        controls.addWidget(self.journal_save_btn)
         layout.addLayout(controls)
         return box
 
@@ -1680,6 +1682,11 @@ class DashboardWidget(QWidget):
         today = dt.date.today()
         try:
             entry = self.journal.read_entry(today)
+        except JournalUnavailable as e:
+            # Missing orgparse: the panel says so and the rest of the
+            # dashboard carries on rather than the app refusing to start.
+            self._disable_journal(str(e))
+            return
         except Exception as e:
             self.journal_status.setText(f"could not read journal.org: {soft_wrap(e)}")
             return
@@ -1692,6 +1699,15 @@ class DashboardWidget(QWidget):
         self.rating_input.setValue(entry.rating or 0.0)
         self.journal_status.setText("today's entry loaded.")
 
+    def _disable_journal(self, message):
+        """Grey the panel out with a reason instead of leaving controls that
+        can only fail."""
+        self.journal_body.setEnabled(False)
+        self.rating_input.setEnabled(False)
+        self.journal_save_btn.setEnabled(False)
+        self.journal_history_btn.setEnabled(False)
+        self.journal_status.setText(message)
+
     def _save_journal(self):
         rating = self.rating_input.value()
         if rating < 1.0:
@@ -1700,14 +1716,27 @@ class DashboardWidget(QWidget):
         try:
             self.journal.write_entry(dt.date.today(), rating,
                                      self.journal_body.toPlainText())
+        except JournalUnavailable as e:
+            self._disable_journal(str(e))
+            return
         except Exception as e:
             self.journal_status.setText(f"save failed: {soft_wrap(e)}")
             return
         self.journal_status.setText(f"saved {dt.datetime.now().strftime('%H:%M')}")
 
     def _show_journal_history(self):
-        JournalHistoryDialog(self.journal, self.scaler, self.body_font,
-                             self.title_font, self).exec()
+        # An exception escaping a slot aborts the whole Qt app, so the dialog
+        # gets built inside the guard, not just the store call.
+        try:
+            dialog = JournalHistoryDialog(self.journal, self.scaler,
+                                          self.body_font, self.title_font, self)
+        except JournalUnavailable as e:
+            self._disable_journal(str(e))
+            return
+        except Exception as e:
+            self.journal_status.setText(f"could not open history: {soft_wrap(e)}")
+            return
+        dialog.exec()
 
     # ── panel: weather ───────────────────────────────────────────────
     def _build_weather_panel(self):

@@ -32,7 +32,10 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-import orgparse
+try:
+    import orgparse
+except ImportError:            # handled per-call, see _require_orgparse
+    orgparse = None
 
 from paths import JOURNAL_PATH
 from storage import atomic_write_text
@@ -41,6 +44,19 @@ ENTRY_HEADING = "Entry"
 RATING_PROPERTY = "RATING"
 MIN_RATING = 1.0
 MAX_RATING = 10.0
+
+MISSING_ORGPARSE = "journal needs orgparse — run: py -m pip install orgparse"
+
+
+class JournalUnavailable(RuntimeError):
+    """The journal can't be read or written — currently only ever raised for
+    a missing orgparse. Kept separate from ValueError so the panel can tell a
+    setup problem from a bad rating."""
+
+
+def _require_orgparse():
+    if orgparse is None:
+        raise JournalUnavailable(MISSING_ORGPARSE)
 
 # Fixed English names, matching org-datetree's own default output. Only ever
 # used when *writing* a new heading — reading matches on the date prefix, so a
@@ -235,6 +251,7 @@ class JournalStore:
     @staticmethod
     def _scan(text: str):
         """(lines, [_Rec…]) with the recs in document order."""
+        _require_orgparse()
         lines = text.splitlines()
         nodes = list(orgparse.loads(text)[1:])  # [0] is the file-level root
         recs = []
