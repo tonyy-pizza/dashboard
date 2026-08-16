@@ -1,48 +1,48 @@
 #!/usr/bin/env python3
 """
 Dashboard Collector — joputer edition
-Replaces jobox's dashboard.service + notetaker.service.
 
-Runs standalone (no persistent process). Meant to be triggered:
-  - On-demand via the widget's ↻ button (spawned as a subprocess)
+Headless data gatherer. Runs standalone (no persistent process), triggered:
+  - on demand by the widget's ↻ button (spawned as a subprocess)
+  - on the widget's background refresh timer (calendar/market freshness)
 
-Gathers everything into ONE cache file, written atomically (tmp file +
+Everything it gathers goes into ONE cache file, written atomically (tmp file +
 rename) so the widget's QFileSystemWatcher never sees a half-written file.
 
+It owns the *read-only* panels only — Weather, Greed Index, Sector Analysis
+and Calendar. To Do, Habit Tracker, Journal and Rough Notes are written by the
+widget straight to their own files and never appear in cache.json.
+
+No Ollama. Local inference used to lock the machine up for minutes on every
+refresh; the panels that depended on it (Daily Briefing, AI-inferred To Do,
+Project Status) are gone, along with the News RSS panel. Nothing here talks to
+localhost:11434 any more.
+
 Setup:
-    pip install yfinance requests feedparser
+    pip install yfinance requests
+    pip install google-api-python-client google-auth-oauthlib   # calendar
 
 Usage:
-    py collector.py
+    py collector.py            # gather everything, write cache.json
+    py collector.py --auth     # one-time Google Calendar OAuth consent
 """
 
-import calendar
+import datetime as dt
 import json
 import os
 import sys
 import tempfile
 import time
-import datetime as dt
-from pathlib import Path
 
 import requests
 import yfinance as yf
 
-try:
-    import feedparser
-except ImportError:
-    feedparser = None
-
+import gcal
+from paths import CACHE_PATH
 
 # ─────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────
-
-DOOMNOTES_DIR = Path(r"C:\Users\joey\doomnotes")
-CACHE_PATH    = Path(r"C:\Users\joey\dashboard-project-files\cache.json")
-
-OLLAMA_URL   = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "qwen3:8b"
 
 # Vancouver, BC — update if needed
 WEATHER_LAT = 49.2827
@@ -50,14 +50,6 @@ WEATHER_LON = -123.1207
 
 # CNN Fear & Greed index (unofficial JSON endpoint used by cnn.com itself)
 GREED_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
-
-NEWS_FEEDS = [
-    ("MarketWatch",  "http://feeds.marketwatch.com/marketwatch/topstories/"),
-    ("Yahoo Finance","https://finance.yahoo.com/news/rssindex"),
-    ("FT Markets",   "https://www.ft.com/markets?format=rss"),
-    ("CNBC Markets", "https://www.cnbc.com/id/20910258/device/rss/rss.html"),
-]
-NEWS_MAX_PER_FEED = 6
 
 SP500_SECTOR_ETFS = {
     "XLK": "Technology", "XLF": "Financials", "XLE": "Energy",
@@ -70,143 +62,6 @@ TSX_SECTOR_ETFS = {
     "XMA.TO": "Materials", "XST.TO": "Cons. Staples", "XUT.TO": "Utilities",
     "XRE.TO": "Real Estate",
 }
-
-NOTETAKER_SKIP_HEADER = "#+NOTETAKER: skip"
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# OLLAMA
-# ─────────────────────────────────────────────────────────────────────────
-
-def check_ollama_connection() -> bool:
-    """Ping Ollama before doing anything else, and print a clear status line.
-    This is what you should watch when debugging from a terminal."""
-    try:
-        resp = requests.get("http://localhost:11434/api/tags", timeout=10)
-        resp.raise_for_status()
-        models = [m.get("name", "?") for m in resp.json().get("models", [])]
-        print(f"[ollama] Connected. Installed models: {models}")
-        if not any(OLLAMA_MODEL in m for m in models):
-            print(f"[ollama] WARNING: '{OLLAMA_MODEL}' not found in installed models. "
-                  f"Run: ollama pull {OLLAMA_MODEL}")
-            return False
-        return True
-    except requests.exceptions.ConnectionError:
-        print(f"[ollama] FAILED: could not connect to http://localhost:11434 — "
-              f"is 'ollama serve' running? Try: ollama list")
-        return False
-    except Exception as e:
-        print(f"[ollama] FAILED: {e}")
-        return False
-
-
-def call_ollama(prompt: str, timeout: int = 90) -> str:
-    """Single-shot Ollama call. keep_alive=0 forces immediate VRAM unload
-    so it doesn't fight with gaming/AI workloads between runs."""
-    try:
-        resp = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "keep_alive": "0",
-            },
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        return resp.json().get("response", "").strip()
-    except Exception as e:
-        print(f"[ollama] Call failed: {e}")
-        return f"[Ollama unavailable: {e}]"
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# ORG FILES — TODOS + PROJECT STATUS + BRIEFING
-# ─────────────────────────────────────────────────────────────────────────
-
-def find_org_files():
-    if not DOOMNOTES_DIR.exists():
-        return []
-    files = []
-    for p in DOOMNOTES_DIR.rglob("*.org"):
-        try:
-            text = p.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            continue
-        # cheaper check: only scan first few lines for the skip header
-        head = "\n".join(text.splitlines()[:5])
-        if NOTETAKER_SKIP_HEADER in head:
-            continue
-        files.append((p, text))
-    return files
-
-
-def extract_todos(filename: str, content: str) -> list:
-    if not content.strip():
-        return []
-    prompt = (
-        f"Extract concrete action items / TODOs from this org-mode note "
-        f"(file: {filename}). Return ONLY a plain bullet list, one per line, "
-        f"starting each line with '- '. If there are none, return exactly "
-        f"'none'.\n\n{content[:6000]}"
-    )
-    result = call_ollama(prompt)
-    if result.lower().strip() in ("none", "- none", ""):
-        return []
-    items = []
-    for line in result.splitlines():
-        line = line.strip().lstrip("-").strip()
-        if line:
-            items.append(line)
-    return items
-
-
-def summarize_project_status(filename: str, content: str) -> str:
-    if not content.strip():
-        return "No content."
-    prompt = (
-        f"In 1-2 short sentences, summarize the current status of this "
-        f"project note (file: {filename}). Be concrete, no fluff.\n\n"
-        f"{content[:6000]}"
-    )
-    return call_ollama(prompt)
-
-
-def generate_daily_briefing(project_summaries: list) -> str:
-    if not project_summaries:
-        return "No active project notes found."
-    joined = "\n".join(f"- {p['file']}: {p['status']}" for p in project_summaries)
-    prompt = (
-        "Write a short (3-5 sentence), plain-spoken morning briefing summarizing "
-        "the state of these ongoing projects. No headers, no bullet points, "
-        f"just a natural narrative paragraph.\n\n{joined}"
-    )
-    return call_ollama(prompt)
-
-
-def collect_notes():
-    files = find_org_files()
-    todos, projects = [], []
-
-    for path, content in files:
-        rel_name = str(path.relative_to(DOOMNOTES_DIR))
-        for item in extract_todos(rel_name, content):
-            todos.append({"text": item, "source_file": rel_name})
-        status = summarize_project_status(rel_name, content)
-        # File mtime feeds the "LAST COMPLETED" timestamp column in the
-        # widget's Project Status panel.
-        try:
-            updated = dt.datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="minutes")
-        except Exception:
-            updated = None
-        projects.append({"file": rel_name, "status": status, "updated": updated})
-
-    # Most recently touched note first — the widget highlights row one.
-    projects.sort(key=lambda p: p["updated"] or "", reverse=True)
-
-    briefing = generate_daily_briefing(projects)
-    return todos, projects, briefing
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -297,44 +152,6 @@ def collect_greed():
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# NEWS
-# ─────────────────────────────────────────────────────────────────────────
-
-def _entry_published(entry):
-    """Entry publish time as a local-time ISO string, or None."""
-    st = entry.get("published_parsed") or entry.get("updated_parsed")
-    if not st:
-        return None
-    try:
-        return dt.datetime.fromtimestamp(calendar.timegm(st)).isoformat(timespec="minutes")
-    except Exception:
-        return None
-
-
-def collect_news():
-    if feedparser is None:
-        return [{"error": "feedparser not installed"}]
-    items = []
-    for label, url in NEWS_FEEDS:
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:NEWS_MAX_PER_FEED]:
-                items.append({
-                    "source": label,
-                    "title": entry.get("title", ""),
-                    "link": entry.get("link", ""),
-                    "published": _entry_published(entry),
-                })
-        except Exception as e:
-            items.append({"source": label, "title": f"[fetch error: {e}]",
-                          "link": "", "published": None})
-    # Newest first for the widget's live-feed layout (undated items last,
-    # keeping their original feed order).
-    items.sort(key=lambda n: n.get("published") or "", reverse=True)
-    return items
-
-
-# ─────────────────────────────────────────────────────────────────────────
 # SECTOR ANALYSIS
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -349,6 +166,7 @@ def collect_sectors():
     for key in ("sp500", "tsx"):
         out[key].sort(key=lambda r: (r["change_pct"] is None, -(r["change_pct"] or 0)))
 
+    print("[sectors] OK")
     return out
 
 
@@ -372,23 +190,13 @@ def _sector_row(ticker, label):
 
 def run():
     print(f"[{dt.datetime.now()}] Collector starting...")
-    check_ollama_connection()
-
-    todos, projects, briefing = collect_notes()
-    weather = collect_weather()
-    greed = collect_greed()
-    news = collect_news()
-    sectors = collect_sectors()
 
     cache = {
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
-        "briefing": briefing,
-        "todos": todos,
-        "projects": projects,
-        "weather": weather,
-        "greed": greed,
-        "news": news,
-        "sectors": sectors,
+        "weather": collect_weather(),
+        "greed": collect_greed(),
+        "sectors": collect_sectors(),
+        "calendar": gcal.collect_calendar(),
     }
 
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -403,5 +211,21 @@ def run():
     print(f"[{dt.datetime.now()}] Cache written to {CACHE_PATH}")
 
 
-if __name__ == "__main__":
+def main():
+    if "--auth" in sys.argv[1:]:
+        # Interactive: opens a browser for Google's consent screen, then
+        # caches the token so every later headless run can refresh silently.
+        try:
+            print(gcal.authorize())
+        except Exception as e:
+            print(f"[calendar] Authorization failed: {e}")
+            print("Setup steps:")
+            for i, step in enumerate(gcal.SETUP_STEPS, 1):
+                print(f"  {i}. {step}")
+            sys.exit(1)
+        return
     run()
+
+
+if __name__ == "__main__":
+    main()

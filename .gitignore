@@ -1,4 +1,16 @@
 __pycache__/
 *.pyc
-cache.json
+.pytest_cache/
 fonts/
+
+# Collector output
+cache.json
+
+# Dashboard-owned local data — these live next to the scripts on joputer
+todo.json
+habits.json
+rough_notes.txt
+
+# Google Calendar OAuth — never commit these
+credentials.json
+token.json
