@@ -23,7 +23,6 @@ HABITS_PATH = DATA_DIR / "habits.json"
 ROUGH_NOTES_PATH = DATA_DIR / "rough_notes.txt"
 JOURNAL_PATH = DOOMNOTES_DIR / "journal.org"
 
-# Google Calendar OAuth. credentials.json is downloaded from the Google Cloud
-# Console; token.json is written by the first `py collector.py --auth` run.
-GOOGLE_CREDENTIALS_PATH = DATA_DIR / "credentials.json"
-GOOGLE_TOKEN_PATH = DATA_DIR / "token.json"
+# Optional home for the secret iCal address, as an alternative to pasting it
+# into calendar_feed.py. Gitignored, so the URL can't be committed by accident.
+ICAL_URL_PATH = DATA_DIR / "calendar_url.txt"

@@ -20,11 +20,10 @@ localhost:11434 any more.
 
 Setup:
     pip install yfinance requests
-    pip install google-api-python-client google-auth-oauthlib   # calendar
+    pip install icalendar recurring-ical-events                 # calendar
 
 Usage:
     py collector.py            # gather everything, write cache.json
-    py collector.py --auth     # one-time Google Calendar OAuth consent
 """
 
 import datetime as dt
@@ -37,7 +36,7 @@ import time
 import requests
 import yfinance as yf
 
-import gcal
+import calendar_feed
 from paths import CACHE_PATH
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -196,7 +195,7 @@ def run():
         "weather": collect_weather(),
         "greed": collect_greed(),
         "sectors": collect_sectors(),
-        "calendar": gcal.collect_calendar(),
+        "calendar": calendar_feed.collect_calendar(),
     }
 
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -213,16 +212,11 @@ def run():
 
 def main():
     if "--auth" in sys.argv[1:]:
-        # Interactive: opens a browser for Google's consent screen, then
-        # caches the token so every later headless run can refresh silently.
-        try:
-            print(gcal.authorize())
-        except Exception as e:
-            print(f"[calendar] Authorization failed: {e}")
-            print("Setup steps:")
-            for i, step in enumerate(gcal.SETUP_STEPS, 1):
-                print(f"  {i}. {step}")
-            sys.exit(1)
+        # The calendar used to need an OAuth consent run. It doesn't any more,
+        # and this note beats a silent no-op for anyone with the old shortcut.
+        print("The calendar no longer uses OAuth — it reads a secret iCal URL.")
+        for i, step in enumerate(calendar_feed.SETUP_STEPS, 1):
+            print(f"  {i}. {step}")
         return
     run()
 

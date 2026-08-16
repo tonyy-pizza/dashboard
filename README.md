@@ -4,8 +4,8 @@ Frameless PyQt6 desktop dashboard. Two pieces, two very different data flows.
 
 - **`collector.py`** — headless, standalone gatherer for the *read-only*
   panels: weather (Open-Meteo), CNN Fear & Greed, sector ETF performance
-  (yfinance) and this week's Google Calendar. Writes everything **atomically**
-  to `cache.json` (tmp file + rename).
+  (yfinance) and this week's calendar (a secret iCal feed). Writes everything
+  **atomically** to `cache.json` (tmp file + rename).
 - **`dashboard_widget.py`** — the window. It **never fetches remote data**. It
   watches `cache.json` with a `QFileSystemWatcher` (no polling) and re-renders
   on change; the ↻ button spawns `collector.py` through `CollectorRunner`.
@@ -23,33 +23,42 @@ panels are gone, and so is the News RSS panel.
 
 ```
 py -m pip install PyQt6 orgparse yfinance requests
-py -m pip install google-api-python-client google-auth-oauthlib   # calendar only
+py -m pip install icalendar recurring-ical-events   # calendar only
 ```
 
-`orgparse` is the only dependency the old dashboard didn't have — it's what
-reads and writes the journal datetree. If it's missing the journal panel
-disables itself with the install command and the rest of the dashboard still
-starts; the Google libraries are optional in the same way.
+`orgparse` reads and writes the journal datetree; `icalendar` and
+`recurring-ical-events` parse the calendar feed. Both are optional in the same
+way: if a package is missing, its panel says so and the rest of the dashboard
+still starts.
 
 Paths live in `paths.py`. They default to the real joputer locations and can
 be pointed elsewhere with `DASHBOARD_DATA_DIR` / `DASHBOARD_NOTES_DIR` (that's
 how the tests run off-machine).
 
-## Google Calendar — one-time setup, by hand
+## Calendar — point it at your secret iCal address
 
-No OAuth credentials exist yet. Until they do, the Calendar panel shows these
-steps instead of a week grid and nothing else is affected:
+No Google API, no OAuth, no consent screen. The collector fetches one `.ics`
+file over HTTPS, so this works with any provider that publishes a private
+iCal address. Until a URL is set, the Calendar panel shows these steps instead
+of a week grid and nothing else is affected:
 
-1. console.cloud.google.com → new project
-2. APIs & Services → enable **Google Calendar API**
-3. OAuth consent screen → External → add your own account as a test user
-4. Credentials → Create OAuth client ID → **Desktop app**
-5. Download the JSON to
-   `C:\Users\joey\dashboard-project-files\credentials.json`
-6. Run `py collector.py --auth` once — it opens a browser, you approve, and
-   the token is cached to `token.json`
+1. Google Calendar → Settings → click your calendar in the left sidebar
+2. Scroll to **Integrate calendar** → copy **Secret address in iCal format**
+   (it ends in `/basic.ics`)
+3. Put it in **one** of two places:
+   - `ICAL_URL` at the top of `calendar_feed.py`, replacing
+     `PASTE_YOUR_SECRET_ICAL_URL_HERE`, or
+   - the first line of
+     `C:\Users\joey\dashboard-project-files\calendar_url.txt`
 
-After that every headless collector run refreshes the token silently.
+**Anyone with that URL can read your calendar.** If this folder is a git
+repo, use `calendar_url.txt` — it's gitignored, so the URL can't be committed
+by accident. `calendar_feed.py` is tracked, so a URL pasted there would be.
+Regenerate the address from the same settings page if it ever leaks.
+
+Recurring events, cancelled occurrences and multi-day all-day events are all
+handled — `recurring-ical-events` expands the RRULEs for the week being
+displayed.
 
 ## Files
 
@@ -60,7 +69,7 @@ After that every headless collector run refreshes the token silently.
 | `habits.json` | widget | name, goal, archived flag, completed days by ISO date |
 | `journal.org` | widget **and Emacs** | org datetree in `doomnotes/`, stays hand-editable |
 | `rough_notes.txt` | widget | freeform scratch panel, autosaved |
-| `credentials.json` / `token.json` | you / Google | calendar OAuth |
+| `calendar_url.txt` | you | optional home for the secret iCal URL, gitignored |
 
 ### journal.org
 
@@ -91,7 +100,7 @@ properties and sub-headings under a day survive untouched.
 | Group | Panel | Source |
 |---|---|---|
 | today's items | Weather | Open-Meteo, current + H/L + hourly sparkline |
-| today's items | Calendar | Google Calendar, this week, read-only |
+| today's items | Calendar | secret iCal feed, this week, read-only |
 | today's items | To Do | `todo.json` — add, complete, delete, drag within a tier |
 | today's items | Habit Tracker | `habits.json` — `[✓] today` per habit, or click any day in the year grid to backfill |
 | today's items | Journal | `journal.org` — one entry/day, rating 1.0–10.0 |
@@ -127,7 +136,6 @@ light chrome otherwise.
 
 ```
 py collector.py                      # populate/refresh cache.json
-py collector.py --auth               # one-time Google Calendar consent
 pythonw.exe dashboard_widget.py      # launch the widget (shell:startup target)
 ```
 
@@ -141,10 +149,10 @@ all three profiles after reboot, scripts are invoked with `py` (not
 python -m pytest
 ```
 
-109 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
-They cover the org datetree round-trip, the JSON stores, the calendar shaping
-and the widget's wiring — panels build, clicks reach the right file, and a
-`cache.json` renders without blowing up.
+125 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
+They cover the org datetree round-trip, the JSON stores, iCal parsing
+(recurrence, all-day spans, timezones) and the widget's wiring — panels build,
+clicks reach the right file, and a `cache.json` renders without blowing up.
 
 ## Refresh behaviour
 

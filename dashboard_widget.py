@@ -1157,6 +1157,10 @@ class WeekGrid(QWidget):
         start = event.get("start")
         text = summary if event.get("all_day") or not start else f"{start} {summary}"
         label = ElidedLabel(text)
+        # Event titles come from the calendar feed, not from us. QLabel's
+        # AutoText would render anything that looks like HTML — including
+        # <img src="http://…">, which would phone home on every refresh.
+        label.setTextFormat(Qt.TextFormat.PlainText)
         label.setToolTip(self._tooltip(event))
         label.setStyleSheet(f"color: {CREAM}; background: transparent;")
         self._scaler.font(self._body, theme.CAPTION_PX, tabular_nums=True, register=label)

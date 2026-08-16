@@ -11,6 +11,8 @@ todo.json
 habits.json
 rough_notes.txt
 
-# Google Calendar OAuth — never commit these
+# Secrets — never commit these. calendar_url.txt holds the private iCal
+# address; credentials.json/token.json are leftovers from the old OAuth setup.
+calendar_url.txt
 credentials.json
 token.json
