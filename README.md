@@ -116,12 +116,22 @@ this needs the read/write `calendar` scope: enable the Calendar API, create a
 `py calendar_sync.py --auth-google`.
 
 **First run.** Nothing is tagged yet, so a plain first run would create a
-second copy of every event already sitting in both calendars. Two options:
+second copy of every event already sitting in both calendars. Use
+`--reconcile`, which links events that already exist on both sides —
+identical title, identical start, unambiguous 1:1 — instead of duplicating
+them. Ambiguous matches are skipped and sync normally.
 
-- `--dry-run` first, always — read the log, then decide.
-- `--reconcile` on the first real run links events that already exist on both
-  sides (identical title, identical start, unambiguous 1:1) instead of
-  duplicating them. Ambiguous matches are skipped rather than guessed at.
+```
+py calendar_sync.py --dry-run --reconcile     # read the log before going on
+py calendar_sync.py --reconcile               # once only
+py calendar_sync.py                           # every run after that
+```
+
+Read the dry-run log properly before the second command. Every `link` line is
+a claim that two events are the same thing; a wrong link welds two unrelated
+events together, and unlike a duplicate it won't be obvious later. `--reconcile`
+is only needed once — after the first real run everything carries markers, and
+the scheduled task runs without it.
 
 **Scheduling.** Task Scheduler on joputer, every 10 minutes:
 
