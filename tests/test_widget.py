@@ -53,7 +53,7 @@ def test_window_builds_with_every_panel(widget):
 
 def test_group_labels_are_present(widget):
     titles = {label.text() for label in widget.findChildren(dw.QLabel)}
-    assert {"daily interaction", "at a glance", "freeform"} <= titles
+    assert {"today's items", "at a glance", "freeform"} <= titles
 
 
 def test_widening_the_window_scales_the_fonts_up(widget):

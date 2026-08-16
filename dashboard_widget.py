@@ -44,7 +44,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import (
     QEvent, QFileSystemWatcher, QMimeData, QObject, QPoint, QPointF, QRect,
-    Qt, QTimer, pyqtSignal,
+    QRectF, Qt, QTimer, pyqtSignal,
 )
 from PyQt6.QtGui import QColor, QDrag, QFont, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (
@@ -407,10 +407,12 @@ class DotGrid(QWidget):
 
     dayClicked = pyqtSignal(object)
 
+    # Small and compact: the habit panel sits in a half-width column now, so
+    # a full year of dots has to fit in roughly 450px.
     MIN_CELL = 4
-    MAX_CELL = 13
+    MAX_CELL = 8
     GAP = 2
-    LABEL_H = 12
+    LABEL_H = 11
 
     def __init__(self, year, interactive=True, show_months=True, parent=None):
         super().__init__(parent)
@@ -520,21 +522,28 @@ class DotGrid(QWidget):
 
     def paintEvent(self, _event):
         painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         cell, top = self._cell, self._top()
         size = max(2, cell - self.GAP)
         today = dt.date.today()
         empty = QColor(DOT_EMPTY)
 
+        painter.setPen(Qt.PenStyle.NoPen)
         for date in self._dates:
             offset = (date - self._grid_start).days
             x = (offset // 7) * cell
             y = top + (offset % 7) * cell
             value = self._values.get(date)
-            painter.fillRect(QRect(x, y, size, size),
-                             self._fill_color(value) if value else empty)
-            if date == today:
-                painter.setPen(QPen(QColor(CHROME), 1))
-                painter.drawRect(QRect(x, y, size - 1, size - 1))
+            painter.setBrush(self._fill_color(value) if value else empty)
+            painter.drawEllipse(QRectF(x, y, size, size))
+
+        if self._dates[0] <= today <= self._dates[-1]:
+            offset = (today - self._grid_start).days
+            painter.setPen(QPen(QColor(CHROME), 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(QRectF((offset // 7) * cell - 1,
+                                       top + (offset % 7) * cell - 1,
+                                       size + 2, size + 2))
 
         if top:
             painter.setFont(self._label_font)
@@ -1027,13 +1036,17 @@ class JournalHistoryDialog(QDialog):
 class WeekGrid(QWidget):
     """Read-only mini grid of the current week — one column per day."""
 
-    MAX_EVENTS = 5
+    MAX_EVENTS = 7
 
     def __init__(self, scaler, body_family, title_family, parent=None):
         super().__init__(parent)
         self._scaler = scaler
         self._body = body_family
         self._title = title_family
+        # The calendar is the anchor of the top row, so the columns get real
+        # height whether or not there is anything in them this week.
+        self.setMinimumHeight(210)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setStyleSheet("background: transparent;")
         self._layout = QHBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
@@ -1235,22 +1248,24 @@ class DashboardWidget(QWidget):
         grip_row.addWidget(grip)
         outer.addLayout(grip_row)
 
-        # ── group 1: daily interaction ──
-        grid.addWidget(self._group_label("daily interaction"))
+        # ── group 1: today's items ──
+        grid.addWidget(self._group_label("today's items"))
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        # Calendar takes ~70% of the row: it carries the most information and
+        # the weather readout needs far less room than it was getting.
+        row.addWidget(self._build_weather_panel(), 75)
+        row.addWidget(self._build_calendar_panel(), 175)
+        grid.addLayout(row)
         row = QHBoxLayout()
         row.setSpacing(10)
         row.addWidget(self._build_todo_panel(), 100)
-        row.addWidget(self._build_journal_panel(), 110)
+        row.addWidget(self._build_habits_panel(), 100)
         grid.addLayout(row)
-        grid.addWidget(self._build_habits_panel())
+        grid.addWidget(self._build_journal_panel())
 
         # ── group 2: at a glance ──
         grid.addWidget(self._group_label("at a glance"))
-        row = QHBoxLayout()
-        row.setSpacing(10)
-        row.addWidget(self._build_weather_panel(), 100)
-        row.addWidget(self._build_calendar_panel(), 175)
-        grid.addLayout(row)
         row = QHBoxLayout()
         row.setSpacing(10)
         row.addWidget(self._build_greed_panel(), 100)
@@ -1560,9 +1575,14 @@ class DashboardWidget(QWidget):
         self.journal_body = QPlainTextEdit()
         self.journal_body.setPlaceholderText("how did today go?")
         self.journal_body.setStyleSheet(theme.input_style(self.body_font))
-        self.journal_body.setMinimumHeight(96)
+        self.journal_body.setMinimumHeight(120)
+        # Preferred, not the QPlainTextEdit default of Expanding — otherwise
+        # the journal soaks up every spare pixel in the scroll area and shoves
+        # Rough Notes off the bottom.
+        self.journal_body.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                        QSizePolicy.Policy.Preferred)
         self.scaler.font(self.body_font, theme.BODY_PX, register=self.journal_body)
-        layout.addWidget(self.journal_body, 1)
+        layout.addWidget(self.journal_body)
 
         controls = QHBoxLayout()
         controls.setSpacing(8)
@@ -1657,6 +1677,9 @@ class DashboardWidget(QWidget):
         row.addLayout(column, 1)
         layout.addLayout(row)
 
+        # The calendar next door is taller, so the slack lands here: keep the
+        # readout under the title and let the sparkline sit on the baseline.
+        layout.addStretch()
         self.sparkline = Sparkline()
         layout.addWidget(self.sparkline)
         return box
@@ -1687,7 +1710,7 @@ class DashboardWidget(QWidget):
         self.calendar_hint.hide()
         layout.addWidget(self.calendar_hint)
         self.week_grid = WeekGrid(self.scaler, self.body_font, self.title_font)
-        layout.addWidget(self.week_grid)
+        layout.addWidget(self.week_grid, 1)
         return box
 
     def _render_calendar(self, data):

@@ -85,14 +85,19 @@ properties and sub-headings under a day survive untouched.
 
 | Group | Panel | Source |
 |---|---|---|
-| daily interaction | To Do | `todo.json` — add, complete, delete, drag within a tier |
-| daily interaction | Habit Tracker | `habits.json` — click any day in the year grid |
-| daily interaction | Journal | `journal.org` — one entry/day, rating 1.0–10.0 |
-| at a glance | Weather | Open-Meteo, current + H/L + hourly sparkline |
-| at a glance | Calendar | Google Calendar, this week, read-only |
+| today's items | Weather | Open-Meteo, current + H/L + hourly sparkline |
+| today's items | Calendar | Google Calendar, this week, read-only |
+| today's items | To Do | `todo.json` — add, complete, delete, drag within a tier |
+| today's items | Habit Tracker | `habits.json` — click any day in the year grid |
+| today's items | Journal | `journal.org` — one entry/day, rating 1.0–10.0 |
 | at a glance | Greed Index | CNN Fear & Greed |
 | at a glance | Sector Analysis | S&P 500 + TSX sector ETFs, 1-day change |
 | freeform | Rough Notes | `rough_notes.txt`, autosaved |
+
+Weather and Calendar share the top row at roughly 30/70 — the calendar is the
+anchor of the group and gets the height and width to match. To Do and the
+habit tracker share the next row, so the habit grid uses small dots sized to
+fit a full year in a half-width column.
 
 The wall clock lives in the title bar rather than in a panel of its own.
 
@@ -131,7 +136,7 @@ all three profiles after reboot, scripts are invoked with `py` (not
 python -m pytest
 ```
 
-100 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
+102 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
 They cover the org datetree round-trip, the JSON stores, the calendar shaping
 and the widget's wiring — panels build, clicks reach the right file, and a
 `cache.json` renders without blowing up.
