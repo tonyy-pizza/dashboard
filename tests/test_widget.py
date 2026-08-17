@@ -45,6 +45,9 @@ def widget(qapp, tmp_path):
     window._reload_todos()
     window._reload_habits()
     window._reload_journal()
+    # Construction may have kicked a startup refresh; clear it so the
+    # rate-limit floor doesn't leak between tests.
+    window._last_refresh_at = None
     yield window
     window.close()
 
@@ -474,6 +477,73 @@ print("STATUS:" + window.journal_status._full_text)
 
     assert result.returncode == 0, result.stderr
     assert "pip install orgparse" in result.stdout
+
+
+# ── the watcher must ignore our own files ────────────────────────────
+
+def test_adding_a_todo_does_not_re_render_the_cache_panels(widget, monkeypatch):
+    """todo.json lives in the same folder as cache.json. Watching the folder
+    meant every to-do save rebuilt weather, calendar, greed and sectors."""
+    renders = []
+    monkeypatch.setattr(widget, "_load_cache", lambda: renders.append(True))
+
+    widget.todo_input.setText("buy milk")
+    widget._add_todo()
+    widget._on_watched_change(str(dw.CACHE_PATH.parent))    # what Qt would emit
+
+    assert renders == []
+
+
+def test_a_real_cache_write_still_re_renders(widget, monkeypatch):
+    renders = []
+    monkeypatch.setattr(widget, "_load_cache", lambda: renders.append(True))
+
+    write_cache({"generated_at": "2026-08-16T09:30:00", "weather": {},
+                 "greed": {}, "sectors": {}, "calendar": {}})
+    widget._on_watched_change(str(dw.CACHE_PATH))
+
+    assert renders == [True]
+
+
+def test_the_directory_is_only_watched_while_a_file_is_missing(widget):
+    write_cache({"generated_at": "2026-08-16T09:30:00"})
+    write_sync_status(last_run_utc=minutes_ago(1), last_success_utc=minutes_ago(1))
+    widget._arm_watches()
+    directory = str(dw.CACHE_PATH.parent)
+
+    assert directory not in widget.watcher.directories()
+    assert str(dw.CACHE_PATH) in widget.watcher.files()
+
+    dw.CACHE_PATH.unlink()
+    widget._arm_watches()
+
+    assert directory in widget.watcher.directories()
+
+
+# ── automatic refreshes are rate limited ─────────────────────────────
+
+def test_automatic_refreshes_have_a_floor(widget, never_spawn_the_collector):
+    never_spawn_the_collector.clear()
+
+    assert widget._start_refresh("first") is True
+    assert widget._start_refresh("immediately after") is False
+    assert len(never_spawn_the_collector) == 1
+
+
+def test_the_refresh_button_ignores_the_floor(widget, never_spawn_the_collector):
+    widget._start_refresh("automatic")
+    never_spawn_the_collector.clear()
+
+    assert widget._start_refresh(manual=True) is True
+    assert len(never_spawn_the_collector) == 1
+
+
+def test_the_floor_lifts_after_the_gap(widget, never_spawn_the_collector):
+    widget._start_refresh("first")
+    widget._last_refresh_at -= dt.timedelta(seconds=dw.MIN_REFRESH_GAP_SECONDS + 1)
+    never_spawn_the_collector.clear()
+
+    assert widget._start_refresh("later") is True
 
 
 # ── refreshing after a reboot or a sleep ─────────────────────────────

@@ -258,7 +258,7 @@ than only the file that changed.
 python -m pytest
 ```
 
-234 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
+240 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
 They cover the org datetree round-trip, the JSON stores, iCal parsing
 (recurrence, all-day spans, timezones), the sync engine (loop prevention,
 conflict resolution, dry runs, first-run reconciliation) and the widget's
@@ -299,6 +299,18 @@ missed** (task → Settings tab), and/or add a logon trigger:
 schtasks /create /tn "Calendar sync (logon)" /sc onlogon ^
   /tr "pyw C:\Users\joey\dashboard-project-files\calendar_sync.py"
 ```
+
+Automatic runs (timer, launch, wake) also honour a floor of
+`MIN_REFRESH_GAP_SECONDS` (60) between spawns, so nothing can produce a burst
+of collector processes. The ↻ button is exempt.
+
+The watcher watches the two files *other* processes write — `cache.json` and
+`calendar_sync_status.json` — and never the directory they sit in, except
+briefly when one of them doesn't exist yet. That folder also holds
+`todo.json`, `habits.json`, `rough_notes.txt` and the temp files each atomic
+save creates, all written by the widget itself; watching the directory meant
+adding a single to-do re-read the cache and rebuilt four panels several times
+over, which showed up as a stutter.
 
 The other timers in the widget are the title-bar clock and the Rough Notes
 autosave debounce.

@@ -89,6 +89,8 @@ AUTO_REFRESH_MINUTES = 20
 WAKE_GAP_SECONDS = 90
 # How old cache.json has to be before waking or launching triggers a refresh.
 STALE_CACHE_MINUTES = 15
+# Floor between automatic collector runs. The ↻ button ignores it.
+MIN_REFRESH_GAP_SECONDS = 60
 NOTES_SAVE_DELAY_MS = 800
 TODO_MIME = "application/x-dionysus-todo"
 
@@ -1298,6 +1300,7 @@ class DashboardWidget(QWidget):
         self._new_todo_priority = 0
         self._journal_saved_at = None
         self._last_tick = None          # wall clock at the previous tick
+        self._last_refresh_at = None    # when a collector run last started
         self._cache_generated = None    # when the loaded cache.json was written
 
         self.runner = CollectorRunner()
@@ -2120,25 +2123,61 @@ class DashboardWidget(QWidget):
         super().closeEvent(event)
 
     # ── file watching (no polling) ───────────────────────────────────
+    WATCHED_FILES = ("cache", "sync status")
+
     def _setup_watcher(self):
-        # Two watched files, same zero-polling pattern: cache.json from the
-        # collector, and the status file calendar_sync.py writes each run.
+        """Watch the two files other processes write, and nothing else.
+
+        The data directory also holds todo.json, habits.json, rough_notes.txt
+        and the temp files every atomic save creates — all written by this
+        widget. Watching the directory itself meant adding one to-do fired
+        several change events, each re-reading cache.json and rebuilding four
+        panels, which is visible as a stutter.
+        """
         self.watcher = QFileSystemWatcher()
         CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        self.watcher.addPath(str(CACHE_PATH.parent))
-        for path in (CACHE_PATH, SYNC_STATUS_PATH):
-            if path.exists():
-                self.watcher.addPath(str(path))
         self.watcher.fileChanged.connect(self._on_watched_change)
         self.watcher.directoryChanged.connect(self._on_watched_change)
+        self._watch_stamps = self._target_stamps()
+        self._arm_watches()
+
+    def _arm_watches(self):
+        """Watch each target file directly. A file that doesn't exist yet
+        can't be watched, so fall back to the directory until it shows up —
+        and drop that fallback as soon as it does."""
+        watched = set(self.watcher.files())
+        missing = False
+        for path in (CACHE_PATH, SYNC_STATUS_PATH):
+            if not path.exists():
+                missing = True
+            elif str(path) not in watched:
+                # An atomic replace drops the old inode and with it the watch.
+                self.watcher.addPath(str(path))
+
+        directory = str(CACHE_PATH.parent)
+        watching_directory = directory in set(self.watcher.directories())
+        if missing and not watching_directory:
+            self.watcher.addPath(directory)
+        elif not missing and watching_directory:
+            self.watcher.removePath(directory)
+
+    @staticmethod
+    def _target_stamps():
+        stamps = {}
+        for path in (CACHE_PATH, SYNC_STATUS_PATH):
+            try:
+                info = path.stat()
+                stamps[path] = (info.st_mtime_ns, info.st_size)
+            except OSError:
+                stamps[path] = None
+        return stamps
 
     def _on_watched_change(self, _path):
-        # An atomic replace drops the old inode, so re-arm the watch on any
-        # path that came back.
-        watched = set(self.watcher.files())
-        for path in (CACHE_PATH, SYNC_STATUS_PATH):
-            if path.exists() and str(path) not in watched:
-                self.watcher.addPath(str(path))
+        self._arm_watches()
+        stamps = self._target_stamps()
+        if stamps == self._watch_stamps:
+            return          # something else in the folder moved — not ours
+        self._watch_stamps = stamps
         self._load_cache()
         self._load_sync_status()
 
@@ -2162,10 +2201,22 @@ class DashboardWidget(QWidget):
         self.scaler.reapply()
 
     # ── refresh ──────────────────────────────────────────────────────
-    def _start_refresh(self, reason=None) -> bool:
-        """Spawn the collector unless one is already running."""
+    def _start_refresh(self, reason=None, manual=False) -> bool:
+        """Spawn the collector unless one is already running.
+
+        Automatic triggers also honour a floor between runs. Nothing should
+        be able to fire them in a burst, but a stream of spawned processes is
+        an unpleasant thing to be wrong about — the ↻ button is exempt, since
+        that's someone explicitly asking.
+        """
+        now = dt.datetime.now()
+        if not manual and self._last_refresh_at is not None:
+            since = (now - self._last_refresh_at).total_seconds()
+            if since < MIN_REFRESH_GAP_SECONDS:
+                return False
         if not self.runner.run_async():
             return False
+        self._last_refresh_at = now
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setText("…")
         self.status_label.setText(
@@ -2192,7 +2243,7 @@ class DashboardWidget(QWidget):
         self._reload_todos()
         self._reload_habits()
         self._reload_journal()
-        self._start_refresh()
+        self._start_refresh(manual=True)
 
     def _auto_refresh_tick(self):
         if self._auto_refresh:
