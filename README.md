@@ -196,10 +196,14 @@ printed. A file is only ever moved into an empty slot, so it can never
 overwrite something newer.
 
 Three things stay in the root because they aren't ours to move: `.git\`,
-`.gitignore` and `__pycache__\`. The `.tmp` files you may have noticed are
-from atomic writes — they're created next to their target and renamed over it,
-which is what makes the write atomic, so they deliberately don't get their own
-folder. One only lingers if a write is interrupted, and it's gitignored.
+`.gitignore` and `__pycache__\`.
+
+**`.tmp` files** are atomic-write scratch: each save writes one and renames it
+over its target, which is what makes the write atomic. They deliberately don't
+get their own folder — the rename is only atomic within a single directory.
+One is only left behind when a write is killed part-way, and `paths.prepare()`
+deletes any that are over an hour old on the next run, so they can't pile up.
+Deleting them by hand is always safe.
 
 ### journal.org
 
@@ -291,7 +295,7 @@ than only the file that changed.
 python -m pytest
 ```
 
-257 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
+261 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
 They cover the org datetree round-trip, the JSON stores, iCal parsing
 (recurrence, all-day spans, timezones), the sync engine (loop prevention,
 conflict resolution, dry runs, first-run reconciliation) and the widget's

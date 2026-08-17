@@ -81,6 +81,65 @@ def test_prepare_is_safe_to_call_repeatedly(paths_in):
     assert paths.prepare() == []          # nothing left to move
 
 
+# ── sweeping orphaned scratch files ──────────────────────────────────
+
+def age(path, seconds):
+    old = os.stat(path).st_mtime - seconds
+    os.utime(path, (old, old))
+
+
+def test_stale_temp_files_are_swept(paths_in, tmp_path):
+    paths = paths_in()
+    paths.ensure_dirs()
+    leftovers = [tmp_path / "tmpa1b2.tmp", paths.CACHE_DIR / "tmpc3d4.tmp",
+                 paths.USER_DATA_DIR / "tmpe5f6.tmp"]
+    for leftover in leftovers:
+        leftover.write_text("half a write", encoding="utf-8")
+        age(leftover, 7200)
+
+    paths.prepare()
+
+    assert not any(leftover.exists() for leftover in leftovers)
+
+
+def test_a_temp_file_from_a_live_write_is_left_alone(paths_in, tmp_path):
+    """A write in flight owns its scratch file; sweeping it would corrupt it."""
+    paths = paths_in()
+    paths.ensure_dirs()
+    in_flight = paths.CACHE_DIR / "tmp99zz.tmp"
+    in_flight.write_text("being written right now", encoding="utf-8")
+
+    paths.prepare()
+
+    assert in_flight.exists()
+
+
+def test_the_sweep_leaves_real_files_alone(paths_in, tmp_path):
+    paths = paths_in()
+    paths.ensure_dirs()
+    paths.CACHE_PATH.write_text("{}", encoding="utf-8")
+    age(paths.CACHE_PATH, 7200)
+    keeper = tmp_path / "collector.py"
+    keeper.write_text("print('hi')", encoding="utf-8")
+    age(keeper, 7200)
+
+    paths.prepare()
+
+    assert paths.CACHE_PATH.exists()
+    assert keeper.exists()
+
+
+def test_the_sweep_reports_what_it_removed(paths_in, tmp_path):
+    paths = paths_in()
+    paths.ensure_dirs()
+    leftover = tmp_path / "tmpdead.tmp"
+    leftover.write_text("x", encoding="utf-8")
+    age(leftover, 7200)
+
+    assert paths.sweep_temp_files() == [leftover]
+    assert paths.sweep_temp_files() == []
+
+
 # ── migrating the old flat layout ────────────────────────────────────
 
 def test_files_from_the_flat_layout_are_rehomed(paths_in, tmp_path):

@@ -21,6 +21,7 @@ a non-Windows machine and in the tests.
 
 import os
 import shutil
+import time
 from pathlib import Path
 
 PROJECT_DIR = Path(os.environ.get(
@@ -89,9 +90,37 @@ LEGACY_LAYOUT = {
 }
 
 
+# A write creates its scratch file and renames it over the target within
+# milliseconds. One still sitting here an hour later belongs to a run that
+# was killed — the collector hitting the widget's 300s timeout, the machine
+# sleeping mid-write, a reboot.
+TEMP_SWEEP_AGE_SECONDS = 3600
+
+
 def ensure_dirs() -> None:
     for directory in MANAGED_DIRS:
         directory.mkdir(parents=True, exist_ok=True)
+
+
+def sweep_temp_files(older_than_seconds=TEMP_SWEEP_AGE_SECONDS) -> list:
+    """Delete orphaned atomic-write scratch files.
+
+    Only ones old enough that no live write could still own them, so this is
+    safe to run while the dashboard and the sync are going.
+    """
+    cutoff = time.time() - older_than_seconds
+    removed = []
+    for directory in (PROJECT_DIR,) + MANAGED_DIRS:
+        if not directory.is_dir():
+            continue
+        for leftover in directory.glob("*.tmp"):
+            try:
+                if leftover.is_file() and leftover.stat().st_mtime < cutoff:
+                    leftover.unlink()
+                    removed.append(leftover)
+            except OSError:
+                continue        # locked or already gone
+    return removed
 
 
 def migrate_legacy_files() -> list:
@@ -117,7 +146,11 @@ def migrate_legacy_files() -> list:
 
 
 def prepare() -> list:
-    """Create the folders and rehome anything from the old layout. Every
-    entry point calls this before touching a file."""
+    """Create the folders, rehome anything from the old layout, and clear out
+    orphaned scratch files. Every entry point calls this before touching a
+    file. Returns the moves, which are worth reporting; the swept temp files
+    are garbage by definition and go quietly."""
     ensure_dirs()
-    return migrate_legacy_files()
+    moved = migrate_legacy_files()
+    sweep_temp_files()
+    return moved

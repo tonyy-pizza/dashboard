@@ -27,10 +27,7 @@ Usage:
 """
 
 import datetime as dt
-import json
-import os
 import sys
-import tempfile
 import time
 
 import requests
@@ -38,6 +35,7 @@ import yfinance as yf
 
 import calendar_feed
 from paths import CACHE_PATH, prepare as prepare_directories
+from storage import save_json
 
 # ─────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -200,14 +198,11 @@ def run():
         "calendar": calendar_feed.collect_calendar(),
     }
 
-    CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    # Atomic write: tmp file + rename, so the widget's file watcher never
-    # sees a partially-written cache.
-    fd, tmp_path = tempfile.mkstemp(dir=CACHE_PATH.parent, suffix=".tmp")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(cache, f, indent=2, ensure_ascii=False)
-    os.replace(tmp_path, CACHE_PATH)
+    # Atomic write (tmp file + rename), so the widget's file watcher never
+    # sees a partially-written cache. This used to be a hand-rolled copy of
+    # storage.save_json that lacked its cleanup, and leaked a .tmp file every
+    # time a run was cut short — which the widget does on its 300s timeout.
+    save_json(CACHE_PATH, cache)
 
     print(f"[{dt.datetime.now()}] Cache written to {CACHE_PATH}")
 
