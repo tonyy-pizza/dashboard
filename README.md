@@ -208,7 +208,7 @@ properties and sub-headings under a day survive untouched.
 | today's items | Journal | `journal.org` — one entry/day, rating 1.0–10.0 |
 | at a glance | Greed Index | CNN Fear & Greed |
 | at a glance | Sector Analysis | S&P 500 + TSX sector ETFs, 1-day change |
-| freeform | Rough Notes | `rough_notes.txt`, autosaved |
+| freeform | Rough Notes | `rough_notes.txt`, autosaved — **switched off**, see below |
 
 Weather and Calendar share the top row at roughly 30/70 — the calendar is the
 anchor of the group and gets the height and width to match. To Do and the
@@ -216,6 +216,11 @@ habit tracker share the next row, so the habit grid uses small dots sized to
 fit a full year in a half-width column.
 
 The wall clock lives in the title bar rather than in a panel of its own.
+
+Rough Notes is switched off: `SHOW_ROUGH_NOTES = False` near the top of
+`dashboard_widget.py`. The panel, its autosave and `rough_notes.txt` are all
+still there and intact — flip the flag to True to bring the panel and its
+"freeform" heading back.
 
 ## Look
 
@@ -258,7 +263,7 @@ than only the file that changed.
 python -m pytest
 ```
 
-240 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
+243 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
 They cover the org datetree round-trip, the JSON stores, iCal parsing
 (recurrence, all-day spans, timezones), the sync engine (loop prevention,
 conflict resolution, dry runs, first-run reconciliation) and the widget's

@@ -91,6 +91,11 @@ WAKE_GAP_SECONDS = 90
 STALE_CACHE_MINUTES = 15
 # Floor between automatic collector runs. The ↻ button ignores it.
 MIN_REFRESH_GAP_SECONDS = 60
+
+# The freeform Rough Notes panel is switched off. Set this back to True to
+# bring it and its group heading back — the panel and its autosave are intact,
+# just not built, and rough_notes.txt is left on disk untouched either way.
+SHOW_ROUGH_NOTES = False
 NOTES_SAVE_DELAY_MS = 800
 TODO_MIME = "application/x-dionysus-todo"
 
@@ -1301,6 +1306,8 @@ class DashboardWidget(QWidget):
         self._journal_saved_at = None
         self._last_tick = None          # wall clock at the previous tick
         self._last_refresh_at = None    # when a collector run last started
+        self.notes_edit = None          # stays None while SHOW_ROUGH_NOTES is off
+        self.notes_caption = None
         self._cache_generated = None    # when the loaded cache.json was written
 
         self.runner = CollectorRunner()
@@ -1403,8 +1410,9 @@ class DashboardWidget(QWidget):
         grid.addLayout(row)
 
         # ── group 3: freeform ──
-        grid.addWidget(self._group_label("freeform"))
-        grid.addWidget(self._build_notes_panel())
+        if SHOW_ROUGH_NOTES:
+            grid.addWidget(self._group_label("freeform"))
+            grid.addWidget(self._build_notes_panel())
         grid.addStretch()
 
     def _build_title_bar(self):
@@ -2066,6 +2074,8 @@ class DashboardWidget(QWidget):
         return box
 
     def _load_notes(self):
+        if self.notes_edit is None:      # panel switched off
+            return
         try:
             text = Path(ROUGH_NOTES_PATH).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
@@ -2079,6 +2089,8 @@ class DashboardWidget(QWidget):
         self._notes_timer.start(NOTES_SAVE_DELAY_MS)
 
     def _save_notes(self):
+        if self.notes_edit is None:      # panel switched off
+            return
         try:
             atomic_write_text(ROUGH_NOTES_PATH, self.notes_edit.toPlainText())
             self.notes_caption.setText(f"saved {dt.datetime.now().strftime('%H:%M')}")

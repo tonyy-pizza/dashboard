@@ -61,13 +61,13 @@ def todo_rows(widget):
 def test_window_builds_with_every_panel(widget):
     titles = {label.text() for label in widget.findChildren(dw.QLabel)}
     for panel in ("to do", "habit tracker", "journal", "weather",
-                  "calendar", "sector analysis", "rough notes"):
+                  "calendar", "sector analysis"):
         assert panel in titles
 
 
 def test_group_labels_are_present(widget):
     titles = {label.text() for label in widget.findChildren(dw.QLabel)}
-    assert {"today's items", "at a glance", "freeform"} <= titles
+    assert {"today's items", "at a glance"} <= titles
 
 
 def test_widening_the_window_scales_the_fonts_up(widget):
@@ -816,18 +816,59 @@ def test_a_clock_skewed_future_timestamp_does_not_read_as_negative():
     assert dw._ago(ahead) == "just now"
 
 
-# ── rough notes ──────────────────────────────────────────────────────
+# ── rough notes (switched off) ───────────────────────────────────────
 
-def test_rough_notes_save_and_reload(widget):
-    widget.notes_edit.setPlainText("remember the milk")
+def test_rough_notes_is_switched_off_by_default(widget):
+    titles = {label.text() for label in widget.findChildren(dw.QLabel)}
+
+    assert "rough notes" not in titles
+    assert "freeform" not in titles
+    assert widget.notes_edit is None
+
+
+def test_the_notes_autosave_is_inert_while_it_is_off(widget):
+    """Nothing should touch rough_notes.txt with the panel switched off."""
+    dw.ROUGH_NOTES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    dw.ROUGH_NOTES_PATH.write_text("kept as it was", encoding="utf-8")
+
     widget._save_notes()
-
-    assert dw.ROUGH_NOTES_PATH.read_text(encoding="utf-8") == "remember the milk"
-    widget.notes_edit.setPlainText("")
     widget._load_notes()
-    assert widget.notes_edit.toPlainText() == "remember the milk"
+    widget.close()                       # closeEvent flushes the debounce
+
+    assert dw.ROUGH_NOTES_PATH.read_text(encoding="utf-8") == "kept as it was"
 
 
-def test_typing_queues_a_debounced_save(widget):
-    widget.notes_edit.setPlainText("typing…")
-    assert widget._notes_timer.isActive() is True
+def test_turning_it_back_on_restores_the_panel(qapp, monkeypatch):
+    monkeypatch.setattr(dw, "SHOW_ROUGH_NOTES", True)
+
+    window = dw.DashboardWidget()
+
+    titles = {label.text() for label in window.findChildren(dw.QLabel)}
+    assert "rough notes" in titles
+    assert "freeform" in titles
+    assert window.notes_edit is not None
+    window.close()
+
+
+def test_notes_still_save_and_reload_when_on(qapp, monkeypatch):
+    monkeypatch.setattr(dw, "SHOW_ROUGH_NOTES", True)
+    window = dw.DashboardWidget()
+
+    window.notes_edit.setPlainText("remember the milk")
+    window._save_notes()
+    assert dw.ROUGH_NOTES_PATH.read_text(encoding="utf-8") == "remember the milk"
+
+    window.notes_edit.setPlainText("")
+    window._load_notes()
+    assert window.notes_edit.toPlainText() == "remember the milk"
+    window.close()
+
+
+def test_typing_queues_a_debounced_save_when_on(qapp, monkeypatch):
+    monkeypatch.setattr(dw, "SHOW_ROUGH_NOTES", True)
+    window = dw.DashboardWidget()
+
+    window.notes_edit.setPlainText("typing…")
+
+    assert window._notes_timer.isActive() is True
+    window.close()
