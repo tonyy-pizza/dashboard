@@ -37,7 +37,7 @@ import requests
 import yfinance as yf
 
 import calendar_feed
-from paths import CACHE_PATH
+from paths import CACHE_PATH, prepare as prepare_directories
 
 # ─────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -189,6 +189,8 @@ def _sector_row(ticker, label):
 
 def run():
     print(f"[{dt.datetime.now()}] Collector starting...")
+    for name, destination in prepare_directories():
+        print(f"[paths] moved {name} → {destination}")
 
     cache = {
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),

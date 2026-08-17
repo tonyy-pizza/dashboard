@@ -54,7 +54,10 @@ from PyQt6.QtWidgets import (
     QScrollArea, QSizeGrip, QSizePolicy, QVBoxLayout, QWidget,
 )
 
-CRASH_LOG = Path(__file__).resolve().parent / "dashboard_crash.log"
+# Deliberately not imported from paths.py: the most likely thing to be broken
+# when startup fails is one of the sibling modules, so the crash reporter has
+# to work without them.
+CRASH_LOG = Path(__file__).resolve().parent / "logs" / "dashboard_crash.log"
 
 # The sibling modules. If one of them is missing or out of date relative to
 # this file, the import blows up before anything can be drawn — and under
@@ -66,6 +69,7 @@ try:
     from journal_store import JournalStore, JournalUnavailable
     from paths import (
         CACHE_PATH, COLLECTOR_SCRIPT, ROUGH_NOTES_PATH, SYNC_STATUS_PATH,
+        prepare as prepare_directories,
     )
     from storage import atomic_write_text, load_json
     from theme import (
@@ -2319,6 +2323,7 @@ def report_startup_failure(error, details) -> int:
     """
     stamp = dt.datetime.now().isoformat(timespec="seconds")
     try:
+        CRASH_LOG.parent.mkdir(parents=True, exist_ok=True)
         CRASH_LOG.write_text(f"{stamp}\n{details}", encoding="utf-8")
         written = f"\n\nFull traceback: {CRASH_LOG}"
     except OSError:
@@ -2337,6 +2342,11 @@ def main() -> int:
     app = QApplication(sys.argv)
     if STARTUP_ERROR is not None:
         return report_startup_failure(*STARTUP_ERROR)
+
+    # Create the cache/ data/ secrets/ logs/ folders and rehome anything an
+    # older flat layout left in the project root.
+    for name, destination in prepare_directories():
+        print(f"moved {name} → {destination}")
 
     theme.apply_app_style(app)
     theme.load_local_fonts()

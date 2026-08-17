@@ -675,10 +675,13 @@ def test_a_stale_sibling_module_reports_instead_of_dying_silently(tmp_path):
     staged.mkdir()
     for module in repo.glob("*.py"):
         shutil.copy(module, staged / module.name)
-    # Roll paths.py back to a version that predates a constant the widget needs.
-    stale = (staged / "paths.py").read_text(encoding="utf-8")
+    # Roll paths.py back to a version that predates a constant the widget
+    # needs. Stripping every line that mentions it keeps this working however
+    # the file is reorganized later.
+    stale = (staged / "paths.py").read_text(encoding="utf-8").splitlines()
     (staged / "paths.py").write_text(
-        stale.split("# ── Google ↔ Outlook two-way sync")[0], encoding="utf-8")
+        "\n".join(line for line in stale if "SYNC_STATUS_PATH" not in line),
+        encoding="utf-8")
 
     script = '''
 import sys
@@ -696,7 +699,7 @@ sys.exit(dw.main())
     assert result.returncode == 1
     assert "SYNC_STATUS_PATH" in result.stdout          # named in the dialog
     assert "different versions" in result.stdout        # and what to do
-    assert (staged / "dashboard_crash.log").exists()
+    assert (staged / "logs" / "dashboard_crash.log").exists()
 
 
 # ── the collector must not flash a console ───────────────────────────

@@ -36,7 +36,7 @@ import datetime as dt
 import logging
 import sys
 
-from paths import SYNC_LOG_PATH, SYNC_STATUS_PATH
+from paths import SYNC_LOG_PATH, SYNC_STATUS_PATH, prepare as prepare_directories
 from storage import load_json, save_json
 from sync_model import GOOGLE, OUTLOOK, plan, sync_window
 
@@ -47,6 +47,8 @@ DAYS_FUTURE = 120
 
 
 def configure_logging(verbose=False):
+    for name, destination in prepare_directories():
+        print(f"[paths] moved {name} -> {destination}")
     log.setLevel(logging.DEBUG if verbose else logging.INFO)
     log.handlers.clear()
     line = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s",

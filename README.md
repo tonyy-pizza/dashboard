@@ -160,18 +160,46 @@ panel can show both.
 
 ## Files
 
-| File | Owner | Notes |
-|---|---|---|
-| `cache.json` | collector | weather, greed, sectors, calendar |
-| `todo.json` | widget | text, priority tier, done flag, manual order |
-| `habits.json` | widget | name, goal, archived flag, completed days by ISO date |
-| `journal.org` | widget **and Emacs** | org datetree in `doomnotes/`, stays hand-editable |
-| `rough_notes.txt` | widget | freeform scratch panel, autosaved |
-| `calendar_url.txt` | you | optional home for the secret iCal URL, gitignored |
-| `gcal_sync_credentials.json` / `gcal_sync_token.json` | you / Google | sync OAuth, read-write scope, gitignored |
-| `graph_app.json` / `graph_token_cache.json` | you / Microsoft | sync app ids + token cache, gitignored |
-| `calendar_sync_status.json` | calendar_sync | last run, last success, error, count |
-| `calendar_sync.log` | calendar_sync | one line per action |
+The scripts sit in the project root; everything they generate goes into one of
+four folders beside them. **They're created automatically on the next run** —
+`collector.py`, `calendar_sync.py` and the widget all call `paths.prepare()`
+before touching anything — so you don't have to make them by hand, but the
+names are:
+
+```
+C:\Users\joey\dashboard-project-files\
+    *.py            the scripts (unchanged)
+    fonts\          Inter + Fraunces, optional
+    cache\          generated, safe to delete at any time
+    data\           your content — back this one up
+    secrets\        credentials, never commit
+    logs\
+```
+
+| File | Folder | Owner | Notes |
+|---|---|---|---|
+| `cache.json` | `cache\` | collector | weather, greed, sectors, calendar |
+| `calendar_sync_status.json` | `cache\` | calendar_sync | last run, last success, error, count |
+| `todo.json` | `data\` | widget | text, priority tier, done flag, manual order |
+| `habits.json` | `data\` | widget | name, goal, archived flag, completed days |
+| `rough_notes.txt` | `data\` | widget | freeform panel (currently switched off) |
+| `calendar_url.txt` | `secrets\` | you | the private iCal address |
+| `gcal_sync_credentials.json` / `gcal_sync_token.json` | `secrets\` | you / Google | sync OAuth, read-write scope |
+| `graph_app.json` / `graph_token_cache.json` | `secrets\` | you / Microsoft | sync app ids + token cache |
+| `calendar_sync.log` | `logs\` | calendar_sync | one line per action |
+| `dashboard_crash.log` | `logs\` | widget | only written if startup fails |
+| `journal.org` | `doomnotes\` | widget **and Emacs** | org datetree, stays hand-editable |
+
+**Your existing files move themselves.** Anything left in the project root
+from the old flat layout is relocated on the next run, and each move is
+printed. A file is only ever moved into an empty slot, so it can never
+overwrite something newer.
+
+Three things stay in the root because they aren't ours to move: `.git\`,
+`.gitignore` and `__pycache__\`. The `.tmp` files you may have noticed are
+from atomic writes — they're created next to their target and renamed over it,
+which is what makes the write atomic, so they deliberately don't get their own
+folder. One only lingers if a write is interrupted, and it's gitignored.
 
 ### journal.org
 
@@ -263,7 +291,7 @@ than only the file that changed.
 python -m pytest
 ```
 
-243 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
+257 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
 They cover the org datetree round-trip, the JSON stores, iCal parsing
 (recurrence, all-day spans, timezones), the sync engine (loop prevention,
 conflict resolution, dry runs, first-run reconciliation) and the widget's
