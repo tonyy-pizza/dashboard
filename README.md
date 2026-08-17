@@ -245,13 +245,20 @@ Windows quirks that are known to matter: the firewall stays disabled across
 all three profiles after reboot, scripts are invoked with `py` (not
 `python`), and autostart uses `pythonw` so nothing flashes a console.
 
+**If the window doesn't appear at all**, `pythonw` has swallowed a startup
+error. Run `py dashboard_widget.py` from a terminal to see it, or read
+`dashboard_crash.log` next to the script — the widget writes the traceback
+there and shows a dialog before giving up. The usual cause is a half-updated
+folder: these modules import each other, so copy the whole set across rather
+than only the file that changed.
+
 ## Tests
 
 ```
 python -m pytest
 ```
 
-224 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
+226 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
 They cover the org datetree round-trip, the JSON stores, iCal parsing
 (recurrence, all-day spans, timezones), the sync engine (loop prevention,
 conflict resolution, dry runs, first-run reconciliation) and the widget's

@@ -40,6 +40,7 @@ import re
 import subprocess
 import sys
 import threading
+import traceback
 from pathlib import Path
 
 from PyQt6.QtCore import (
@@ -49,22 +50,35 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QColor, QDrag, QFont, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDoubleSpinBox, QFrame, QHBoxLayout,
-    QLabel, QLineEdit, QMenu, QPlainTextEdit, QPushButton, QScrollArea,
-    QSizeGrip, QSizePolicy, QVBoxLayout, QWidget,
+    QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
+    QScrollArea, QSizeGrip, QSizePolicy, QVBoxLayout, QWidget,
 )
 
-import theme
-from habit_store import HabitStore, year_dates
-from journal_store import JournalStore, JournalUnavailable
-from paths import (
-    CACHE_PATH, COLLECTOR_SCRIPT, ROUGH_NOTES_PATH, SYNC_STATUS_PATH,
-)
-from storage import atomic_write_text, load_json
-from theme import (
-    BG, BORDER, CHROME, CREAM, CREAM_DIM, DONE_TEXT, DOT_EMPTY, FAINT, HOVER,
-    PANEL_BG, WHITE,
-)
-from todo_store import MAX_PRIORITY, PRIORITY_MARKS, PRIORITY_NAMES, TodoStore
+CRASH_LOG = Path(__file__).resolve().parent / "dashboard_crash.log"
+
+# The sibling modules. If one of them is missing or out of date relative to
+# this file, the import blows up before anything can be drawn — and under
+# pythonw there's no console for the traceback to land in, so the app just
+# silently never appears. Catch it and report it in main() instead.
+try:
+    import theme
+    from habit_store import HabitStore, year_dates
+    from journal_store import JournalStore, JournalUnavailable
+    from paths import (
+        CACHE_PATH, COLLECTOR_SCRIPT, ROUGH_NOTES_PATH, SYNC_STATUS_PATH,
+    )
+    from storage import atomic_write_text, load_json
+    from theme import (
+        BG, BORDER, CHROME, CREAM, CREAM_DIM, DONE_TEXT, DOT_EMPTY, FAINT,
+        HOVER, PANEL_BG, WHITE,
+    )
+    from todo_store import (
+        MAX_PRIORITY, PRIORITY_MARKS, PRIORITY_NAMES, TodoStore,
+    )
+except Exception as import_error:          # reported by main(), see below
+    STARTUP_ERROR = (import_error, traceback.format_exc())
+else:
+    STARTUP_ERROR = None
 
 PYTHON_EXE = "py"
 BASE_W = 1000            # design reference width for proportional scaling
@@ -1466,10 +1480,13 @@ class DashboardWidget(QWidget):
         button.clicked.connect(slot)
         return button
 
-    def _hint(self, text, color=FAINT, size=None):
+    def _hint(self, text, color=None, size=None):
+        # Resolved here rather than as a default argument: defaults are
+        # evaluated while the class is being defined, which would undo the
+        # guarded imports above.
         label = QLabel(text)
         label.setWordWrap(True)
-        label.setStyleSheet(f"color: {color}; background: transparent;")
+        label.setStyleSheet(f"color: {color or FAINT}; background: transparent;")
         self.scaler.font(self.body_font, size or theme.BODY_PX, register=label)
         return label
 
@@ -2172,18 +2189,46 @@ class DashboardWidget(QWidget):
         self.show()  # re-applying flags requires re-showing the window
 
 
-def main():
+def report_startup_failure(error, details) -> int:
+    """Say why the window never appeared, on screen and on disk.
+
+    Launched with pythonw there is no console, so without this the app just
+    doesn't open and there is nothing to go on.
+    """
+    stamp = dt.datetime.now().isoformat(timespec="seconds")
+    try:
+        CRASH_LOG.write_text(f"{stamp}\n{details}", encoding="utf-8")
+        written = f"\n\nFull traceback: {CRASH_LOG}"
+    except OSError:
+        written = ""
+    print(details, file=sys.stderr)
+    QMessageBox.critical(
+        None, "Dashboard failed to start",
+        f"{type(error).__name__}: {error}\n\n"
+        "This usually means the files next to dashboard_widget.py are from "
+        "different versions — copy the whole set across, not just the one "
+        "that changed." + written)
+    return 1
+
+
+def main() -> int:
     app = QApplication(sys.argv)
+    if STARTUP_ERROR is not None:
+        return report_startup_failure(*STARTUP_ERROR)
+
     theme.apply_app_style(app)
     theme.load_local_fonts()
     title = theme.pick_font(theme.TITLE_FAMILIES)
     body = theme.pick_font(theme.BODY_FAMILIES)
     print(f"Title font: {title} | Body font: {body}")
     app.setFont(QFont(body, 9))
-    window = DashboardWidget()
+    try:
+        window = DashboardWidget()
+    except Exception as e:
+        return report_startup_failure(e, traceback.format_exc())
     window.show()
-    sys.exit(app.exec())
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

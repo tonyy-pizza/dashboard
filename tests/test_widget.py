@@ -466,6 +466,59 @@ print("STATUS:" + window.journal_status._full_text)
     assert "pip install orgparse" in result.stdout
 
 
+# ── startup failures must be visible ─────────────────────────────────
+
+def test_a_startup_failure_is_written_to_the_crash_log(monkeypatch, tmp_path):
+    shown = {}
+    monkeypatch.setattr(dw.CRASH_LOG.__class__, "write_text",
+                        lambda self, text, **kw: shown.update(logged=text))
+    monkeypatch.setattr(dw.QMessageBox, "critical",
+                        staticmethod(lambda *a, **k: shown.update(dialog=a[2])))
+
+    code = dw.report_startup_failure(ImportError("no such name"), "traceback here")
+
+    assert code == 1
+    assert "traceback here" in shown["logged"]
+    assert "no such name" in shown["dialog"]
+
+
+def test_a_stale_sibling_module_reports_instead_of_dying_silently(tmp_path):
+    """Under pythonw there's no console, so an import error used to mean the
+    app simply never appeared with nothing to go on."""
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    repo = Path(__file__).resolve().parent.parent
+    staged = tmp_path / "app"
+    staged.mkdir()
+    for module in repo.glob("*.py"):
+        shutil.copy(module, staged / module.name)
+    # Roll paths.py back to a version that predates a constant the widget needs.
+    stale = (staged / "paths.py").read_text(encoding="utf-8")
+    (staged / "paths.py").write_text(
+        stale.split("# ── Google ↔ Outlook two-way sync")[0], encoding="utf-8")
+
+    script = '''
+import sys
+from PyQt6.QtWidgets import QMessageBox
+QMessageBox.critical = staticmethod(lambda *a, **k: print("DIALOG:" + a[2]))
+import dashboard_widget as dw
+sys.exit(dw.main())
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=staged, capture_output=True, text=True,
+        timeout=120, env={**os.environ, "QT_QPA_PLATFORM": "offscreen",
+                          "DASHBOARD_DATA_DIR": str(tmp_path / "data"),
+                          "DASHBOARD_NOTES_DIR": str(tmp_path / "notes")})
+
+    assert result.returncode == 1
+    assert "SYNC_STATUS_PATH" in result.stdout          # named in the dialog
+    assert "different versions" in result.stdout        # and what to do
+    assert (staged / "dashboard_crash.log").exists()
+
+
 # ── the collector must not flash a console ───────────────────────────
 
 def test_windows_gets_the_no_window_flag(monkeypatch):
