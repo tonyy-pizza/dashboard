@@ -258,7 +258,7 @@ than only the file that changed.
 python -m pytest
 ```
 
-226 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
+234 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
 They cover the org datetree round-trip, the JSON stores, iCal parsing
 (recurrence, all-day spans, timezones), the sync engine (loop prevention,
 conflict resolution, dry runs, first-run reconciliation) and the widget's
@@ -268,8 +268,37 @@ never touch a real account.
 
 ## Refresh behaviour
 
-The collector is re-run every 20 minutes in the background so the calendar and
-market data don't go stale (toggleable in the ⚙ menu). That is a *data*
-refresh, not a poll: the widget still only repaints when `QFileSystemWatcher`
-sees a new `cache.json`. The other timers are the title-bar clock and the
-Rough Notes autosave debounce.
+The collector is re-run in the background on three occasions, all of them
+*data* refreshes rather than polling — the widget still only repaints when
+`QFileSystemWatcher` sees a new `cache.json`:
+
+- **On a timer**, every `AUTO_REFRESH_MINUTES` (default 20), toggleable in
+  the ⚙ menu.
+- **At launch**, so a reboot doesn't leave last night's data on screen.
+- **On wake**, so a machine that slept through the afternoon catches up
+  immediately instead of waiting out the timer.
+
+The last two only fire if `cache.json` is older than `STALE_CACHE_MINUTES`
+(15), so restarting the widget twice in a row, or a two-minute nap, doesn't
+kick off a pointless run. The status line names the reason — `refreshing
+(after wake)…`.
+
+Wake is detected by watching the wall clock in the existing one-second clock
+tick: Qt timers don't fire while Windows is suspended, so a gap larger than
+`WAKE_GAP_SECONDS` (90) means time passed without us running. That covers
+sleep, hibernate and lid-close without hooking `WM_POWERBROADCAST`, and it
+also catches a corrected system clock, which wants a refresh anyway.
+
+**The sync is separate** — it's a scheduled task, so Windows decides when it
+runs. After a reboot or a long sleep it simply resumes its 10-minute cadence,
+which means up to one interval of delay. Two optional Task Scheduler settings
+close that gap: tick **Run task as soon as possible after a scheduled start is
+missed** (task → Settings tab), and/or add a logon trigger:
+
+```
+schtasks /create /tn "Calendar sync (logon)" /sc onlogon ^
+  /tr "pyw C:\Users\joey\dashboard-project-files\calendar_sync.py"
+```
+
+The other timers in the widget are the title-bar clock and the Rough Notes
+autosave debounce.

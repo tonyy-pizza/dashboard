@@ -84,6 +84,11 @@ PYTHON_EXE = "py"
 BASE_W = 1000            # design reference width for proportional scaling
 VERSION = "v3.0"
 AUTO_REFRESH_MINUTES = 20
+# A clock jump bigger than this between one-second ticks means the machine
+# was suspended — timers don't run while Windows sleeps.
+WAKE_GAP_SECONDS = 90
+# How old cache.json has to be before waking or launching triggers a refresh.
+STALE_CACHE_MINUTES = 15
 NOTES_SAVE_DELAY_MS = 800
 TODO_MIME = "application/x-dionysus-todo"
 
@@ -172,6 +177,16 @@ def _ago(iso_str):
         if seconds < limit:
             return f"{int(seconds // size)}{unit} ago"
     return f"{int(seconds // 86400)}d ago"
+
+
+def _parse_local(iso_str):
+    """The collector writes `generated_at` as a naive local timestamp."""
+    if not iso_str:
+        return None
+    try:
+        return dt.datetime.fromisoformat(str(iso_str)).replace(tzinfo=None)
+    except (TypeError, ValueError):
+        return None
 
 
 def _sync_stamp(iso_str):
@@ -1282,6 +1297,8 @@ class DashboardWidget(QWidget):
         self.journal = JournalStore()
         self._new_todo_priority = 0
         self._journal_saved_at = None
+        self._last_tick = None          # wall clock at the previous tick
+        self._cache_generated = None    # when the loaded cache.json was written
 
         self.runner = CollectorRunner()
         self.runner.finished.connect(self._on_refresh_done)
@@ -1313,6 +1330,10 @@ class DashboardWidget(QWidget):
         self._notes_timer = QTimer(self)
         self._notes_timer.setSingleShot(True)
         self._notes_timer.timeout.connect(self._save_notes)
+
+        # Launching after a reboot (or after the machine sat off overnight)
+        # otherwise shows whatever the last collector run left behind.
+        self._refresh_if_stale("startup")
 
     # ── UI construction ──────────────────────────────────────────────
     def _build_ui(self):
@@ -2067,6 +2088,22 @@ class DashboardWidget(QWidget):
         self.clock_label.setText(now.strftime("%H:%M"))
         self.date_label.setText(
             f"{DAYS_SHORT[now.weekday()]} {now.day:02d} {MONTHS_SHORT[now.month - 1]}")
+        self._detect_wake(now)
+
+    def _detect_wake(self, now):
+        """Notice that the machine was asleep, by watching the clock jump.
+
+        Qt timers don't fire while Windows is suspended, so the gap between
+        two one-second ticks is only ever large if time passed without us
+        running. Cheaper and far less brittle than hooking
+        WM_POWERBROADCAST, and it catches hibernate and a corrected system
+        clock for free — both of which also leave stale data on screen.
+        """
+        previous, self._last_tick = self._last_tick, now
+        if previous is None or not self._auto_refresh:
+            return
+        if (now - previous).total_seconds() >= WAKE_GAP_SECONDS:
+            self._refresh_if_stale("after wake")
 
     # ── window events ────────────────────────────────────────────────
     def resizeEvent(self, event):
@@ -2115,7 +2152,9 @@ class DashboardWidget(QWidget):
         except (OSError, ValueError):
             return
 
-        self.status_label.setText(f"last sync {_sync_stamp(data.get('generated_at'))}")
+        generated = data.get("generated_at")
+        self._cache_generated = _parse_local(generated)
+        self.status_label.setText(f"last sync {_sync_stamp(generated)}")
         self._render_weather(data.get("weather"))
         self._render_greed(data.get("greed"))
         self._render_sectors(data.get("sectors"))
@@ -2123,21 +2162,41 @@ class DashboardWidget(QWidget):
         self.scaler.reapply()
 
     # ── refresh ──────────────────────────────────────────────────────
+    def _start_refresh(self, reason=None) -> bool:
+        """Spawn the collector unless one is already running."""
+        if not self.runner.run_async():
+            return False
+        self.refresh_btn.setEnabled(False)
+        self.refresh_btn.setText("…")
+        self.status_label.setText(
+            f"refreshing ({reason})…" if reason else "refreshing…")
+        return True
+
+    def cache_age_minutes(self):
+        """How old the loaded cache.json is, or None if there wasn't one."""
+        if self._cache_generated is None:
+            return None
+        return (dt.datetime.now() - self._cache_generated).total_seconds() / 60
+
+    def _refresh_if_stale(self, reason) -> bool:
+        """Refresh only if the data on screen has actually aged — a short nap
+        or a quick restart shouldn't kick off a collector run."""
+        age = self.cache_age_minutes()
+        if age is not None and age < STALE_CACHE_MINUTES:
+            return False
+        return self._start_refresh(reason)
+
     def _manual_refresh(self):
         # Widget-owned files have no watcher (nothing else writes them), so
         # ↻ is also the "re-read what Emacs may have changed" button.
         self._reload_todos()
         self._reload_habits()
         self._reload_journal()
-        if not self.runner.run_async():
-            return
-        self.refresh_btn.setEnabled(False)
-        self.refresh_btn.setText("…")
-        self.status_label.setText("refreshing…")
+        self._start_refresh()
 
     def _auto_refresh_tick(self):
-        if self._auto_refresh and not self.runner.running:
-            self.runner.run_async()
+        if self._auto_refresh:
+            self._start_refresh("scheduled")
 
     def _on_refresh_done(self, success, message):
         self.refresh_btn.setEnabled(True)

@@ -26,6 +26,16 @@ def qapp():
     yield app
 
 
+@pytest.fixture(autouse=True)
+def never_spawn_the_collector(monkeypatch):
+    """The widget now kicks a refresh on startup and on wake. Nothing in the
+    suite should actually launch `py collector.py`."""
+    started = []
+    monkeypatch.setattr(dw.CollectorRunner, "run_async",
+                        lambda self: started.append(True) or True)
+    return started
+
+
 @pytest.fixture
 def widget(qapp, tmp_path):
     window = dw.DashboardWidget()
@@ -464,6 +474,106 @@ print("STATUS:" + window.journal_status._full_text)
 
     assert result.returncode == 0, result.stderr
     assert "pip install orgparse" in result.stdout
+
+
+# ── refreshing after a reboot or a sleep ─────────────────────────────
+
+def fresh_cache(minutes_old=0):
+    stamp = (dt.datetime.now() - dt.timedelta(minutes=minutes_old))
+    write_cache({"generated_at": stamp.isoformat(timespec="seconds"),
+                 "weather": {}, "greed": {}, "sectors": {}, "calendar": {}})
+
+
+def test_a_stale_cache_refreshes_on_wake(widget, never_spawn_the_collector):
+    fresh_cache(minutes_old=180)          # machine slept for three hours
+    widget._load_cache()
+    never_spawn_the_collector.clear()
+
+    now = dt.datetime.now()
+    widget._detect_wake(now - dt.timedelta(hours=3))   # seed the previous tick
+    widget._detect_wake(now)
+
+    assert len(never_spawn_the_collector) == 1
+    assert "after wake" in widget.status_label._full_text
+
+
+def test_a_normal_tick_refreshes_nothing(widget, never_spawn_the_collector):
+    fresh_cache(minutes_old=180)
+    widget._load_cache()
+    never_spawn_the_collector.clear()
+
+    now = dt.datetime.now()
+    widget._detect_wake(now)
+    widget._detect_wake(now + dt.timedelta(seconds=1))
+
+    assert never_spawn_the_collector == []
+
+
+def test_a_short_nap_with_fresh_data_refreshes_nothing(widget,
+                                                       never_spawn_the_collector):
+    fresh_cache(minutes_old=2)            # collector ran just before sleeping
+    widget._load_cache()
+    never_spawn_the_collector.clear()
+
+    now = dt.datetime.now()
+    widget._detect_wake(now - dt.timedelta(minutes=3))
+    widget._detect_wake(now)
+
+    assert never_spawn_the_collector == []
+
+
+def test_wake_refresh_respects_the_auto_refresh_toggle(widget,
+                                                       never_spawn_the_collector):
+    fresh_cache(minutes_old=180)
+    widget._load_cache()
+    widget._toggle_auto_refresh(False)
+    never_spawn_the_collector.clear()
+
+    now = dt.datetime.now()
+    widget._detect_wake(now - dt.timedelta(hours=3))
+    widget._detect_wake(now)
+
+    assert never_spawn_the_collector == []
+    widget._toggle_auto_refresh(True)
+
+
+def test_launching_with_an_old_cache_refreshes(qapp, never_spawn_the_collector):
+    fresh_cache(minutes_old=600)          # machine was off overnight
+    never_spawn_the_collector.clear()
+
+    window = dw.DashboardWidget()
+
+    assert len(never_spawn_the_collector) == 1
+    assert "startup" in window.status_label._full_text
+    window.close()
+
+
+def test_launching_with_a_fresh_cache_does_not(qapp, never_spawn_the_collector):
+    fresh_cache(minutes_old=1)            # just restarted the widget
+    never_spawn_the_collector.clear()
+
+    window = dw.DashboardWidget()
+
+    assert never_spawn_the_collector == []
+    window.close()
+
+
+def test_launching_with_no_cache_at_all_refreshes(qapp, never_spawn_the_collector):
+    if dw.CACHE_PATH.exists():
+        dw.CACHE_PATH.unlink()
+    never_spawn_the_collector.clear()
+
+    window = dw.DashboardWidget()
+
+    assert len(never_spawn_the_collector) == 1
+    window.close()
+
+
+def test_cache_age_is_reported_in_minutes(widget):
+    fresh_cache(minutes_old=45)
+    widget._load_cache()
+
+    assert 44 < widget.cache_age_minutes() < 46
 
 
 # ── startup failures must be visible ─────────────────────────────────
