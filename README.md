@@ -137,8 +137,16 @@ the scheduled task runs without it.
 
 ```
 schtasks /create /tn "Calendar sync" /sc minute /mo 10 ^
-  /tr "py C:\Users\joey\dashboard-project-files\calendar_sync.py"
+  /tr "pyw C:\Users\joey\dashboard-project-files\calendar_sync.py"
 ```
+
+`pyw`, not `py` — the console launcher pops a terminal window on every run,
+which on a 10-minute timer is maddening. `pyw` runs it windowless; the run
+still lands in `calendar_sync.log` either way, so nothing is lost by not
+seeing the console. To change the interval later:
+`schtasks /change /tn "Calendar sync" /ri 5`, or fix an existing task's
+window problem with
+`schtasks /change /tn "Calendar sync" /tr "pyw C:\Users\joey\dashboard-project-files\calendar_sync.py"`.
 
 Polling only — nothing listens on a port, nothing is exposed to the internet.
 
@@ -243,7 +251,7 @@ all three profiles after reboot, scripts are invoked with `py` (not
 python -m pytest
 ```
 
-221 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
+224 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
 They cover the org datetree round-trip, the JSON stores, iCal parsing
 (recurrence, all-day spans, timezones), the sync engine (loop prevention,
 conflict resolution, dry runs, first-run reconciliation) and the widget's

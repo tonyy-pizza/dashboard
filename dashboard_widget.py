@@ -230,6 +230,19 @@ class FontScaler:
 # Background collector runner
 # ─────────────────────────────────────────────────────────────────────────
 
+def no_window_kwargs() -> dict:
+    """Keep a spawned console program from flashing a window.
+
+    `py` is the console launcher, so Windows gives it a console of its own
+    even though our output is piped and the parent is `pythonw` with no
+    console to inherit. CREATE_NO_WINDOW suppresses that; on anything else
+    there's nothing to suppress.
+    """
+    if sys.platform != "win32":
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+
+
 class CollectorRunner(QObject):
     finished = pyqtSignal(bool, str)
 
@@ -253,6 +266,7 @@ class CollectorRunner(QObject):
             result = subprocess.run(
                 [PYTHON_EXE, str(COLLECTOR_SCRIPT)],
                 capture_output=True, text=True, timeout=300,
+                **no_window_kwargs(),
             )
             if result.returncode == 0:
                 self.finished.emit(True, "refreshed.")

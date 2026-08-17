@@ -466,6 +466,36 @@ print("STATUS:" + window.journal_status._full_text)
     assert "pip install orgparse" in result.stdout
 
 
+# ── the collector must not flash a console ───────────────────────────
+
+def test_windows_gets_the_no_window_flag(monkeypatch):
+    monkeypatch.setattr(dw.sys, "platform", "win32")
+    assert dw.no_window_kwargs() == {"creationflags": 0x08000000}
+
+
+def test_other_platforms_pass_nothing_extra(monkeypatch):
+    monkeypatch.setattr(dw.sys, "platform", "linux")
+    assert dw.no_window_kwargs() == {}
+
+
+def test_the_collector_is_spawned_without_a_console(monkeypatch):
+    """A refresh under pythonw would otherwise pop a terminal window."""
+    seen = {}
+
+    class Result:
+        returncode = 0
+        stderr = ""
+
+    monkeypatch.setattr(dw.sys, "platform", "win32")
+    monkeypatch.setattr(dw.subprocess, "run",
+                        lambda *args, **kwargs: seen.update(kwargs) or Result())
+
+    runner = dw.CollectorRunner()
+    runner._run()
+
+    assert seen.get("creationflags") == 0x08000000
+
+
 # ── calendar sync status ─────────────────────────────────────────────
 
 def write_sync_status(**fields):
