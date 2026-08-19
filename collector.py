@@ -35,7 +35,7 @@ import yfinance as yf
 
 import calendar_feed
 from paths import CACHE_PATH, prepare as prepare_directories
-from storage import save_json
+from storage import load_json, save_json
 
 # ─────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -59,6 +59,10 @@ TSX_SECTOR_ETFS = {
     "XMA.TO": "Materials", "XST.TO": "Cons. Staples", "XUT.TO": "Utilities",
     "XRE.TO": "Real Estate",
 }
+
+# Yahoo throttles, and 18 tickers with no bound can outlast the 300s the
+# widget gives the whole run. Past this, keep the previous run's numbers.
+SECTOR_DEADLINE_SECONDS = 120
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -152,18 +156,35 @@ def collect_greed():
 # SECTOR ANALYSIS
 # ─────────────────────────────────────────────────────────────────────────
 
-def collect_sectors():
+def collect_sectors(previous=None, deadline=None):
+    """One row per sector ETF.
+
+    `previous` is the last run's sector block: when the deadline passes, its
+    numbers are carried over rather than blanked, since a day-change figure
+    from an hour ago beats an empty row.
+    """
+    carried_over = {}
+    for key in ("sp500", "tsx"):
+        for row in ((previous or {}).get(key) or []):
+            if row.get("ticker"):
+                carried_over[row["ticker"]] = row
+
     out = {"sp500": [], "tsx": []}
-    for ticker, label in SP500_SECTOR_ETFS.items():
-        out["sp500"].append(_sector_row(ticker, label))
-    for ticker, label in TSX_SECTOR_ETFS.items():
-        out["tsx"].append(_sector_row(ticker, label))
+    stale = 0
+    for key, table in (("sp500", SP500_SECTOR_ETFS), ("tsx", TSX_SECTOR_ETFS)):
+        for ticker, label in table.items():
+            if deadline is not None and time.monotonic() > deadline:
+                out[key].append(carried_over.get(ticker) or
+                                {"ticker": ticker, "label": label, "change_pct": None})
+                stale += 1
+                continue
+            out[key].append(_sector_row(ticker, label))
 
     # Auto-sort by day change, strongest movers first (nulls sort last)
     for key in ("sp500", "tsx"):
         out[key].sort(key=lambda r: (r["change_pct"] is None, -(r["change_pct"] or 0)))
 
-    print("[sectors] OK")
+    print(f"[sectors] OK{f' — {stale} carried over, out of time' if stale else ''}")
     return out
 
 
@@ -186,25 +207,40 @@ def _sector_row(ticker, label):
 # ─────────────────────────────────────────────────────────────────────────
 
 def run():
+    started = time.monotonic()
     print(f"[{dt.datetime.now()}] Collector starting...")
     for name, destination in prepare_directories():
         print(f"[paths] moved {name} → {destination}")
 
-    cache = {
+    # Start from what's already cached, so anything this run fails to refresh
+    # keeps its last known value instead of disappearing.
+    previous = load_json(CACHE_PATH, {})
+    cache = dict(previous) if isinstance(previous, dict) else {}
+
+    # The quick sources first, then write immediately. The market fetch below
+    # can take minutes when Yahoo throttles, and the widget kills the whole
+    # run at 300 seconds — with a single write at the end, one slow source
+    # meant the calendar never reached the dashboard at all.
+    cache.update({
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
         "weather": collect_weather(),
         "greed": collect_greed(),
-        "sectors": collect_sectors(),
         "calendar": calendar_feed.collect_calendar(),
-    }
-
+    })
     # Atomic write (tmp file + rename), so the widget's file watcher never
-    # sees a partially-written cache. This used to be a hand-rolled copy of
-    # storage.save_json that lacked its cleanup, and leaked a .tmp file every
-    # time a run was cut short — which the widget does on its 300s timeout.
+    # sees a partially-written cache.
+    save_json(CACHE_PATH, cache)
+    print(f"[cache] weather, greed and calendar written "
+          f"({time.monotonic() - started:.0f}s)")
+
+    cache["sectors"] = collect_sectors(
+        previous=cache.get("sectors"),
+        deadline=time.monotonic() + SECTOR_DEADLINE_SECONDS)
+    cache["generated_at"] = dt.datetime.now().isoformat(timespec="seconds")
     save_json(CACHE_PATH, cache)
 
-    print(f"[{dt.datetime.now()}] Cache written to {CACHE_PATH}")
+    print(f"[{dt.datetime.now()}] Cache written to {CACHE_PATH} "
+          f"({time.monotonic() - started:.0f}s total)")
 
 
 def main():

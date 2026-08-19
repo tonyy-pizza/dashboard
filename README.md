@@ -308,7 +308,7 @@ than only the file that changed.
 python -m pytest
 ```
 
-271 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
+277 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
 They cover the org datetree round-trip, the JSON stores, iCal parsing
 (recurrence, all-day spans, timezones), the sync engine (loop prevention,
 conflict resolution, dry runs, first-run reconciliation) and the widget's
@@ -317,6 +317,14 @@ renders without blowing up. The sync tests use fake calendar sides, so they
 never touch a real account.
 
 ## Refresh behaviour
+
+The collector writes `cache.json` **twice per run**: weather, greed and the
+calendar first, then the market data. The Yahoo fetch is 18 tickers and can
+take minutes when it throttles — with a single write at the end, one slow
+source meant nothing at all reached the dashboard when the widget's 300-second
+timeout killed the run. The market fetch is also bounded
+(`SECTOR_DEADLINE_SECONDS`), and past it the previous run's numbers are kept
+rather than blanked.
 
 The collector is re-run in the background on three occasions, all of them
 *data* refreshes rather than polling — the widget still only repaints when
