@@ -60,6 +60,19 @@ Recurring events, cancelled occurrences and multi-day all-day events are all
 handled — `recurring-ical-events` expands the RRULEs for the week being
 displayed.
 
+**If the panel looks stale, test the feed:**
+
+```
+py calendar_feed.py
+```
+
+It walks the same three steps the collector does — find the URL, fetch it,
+parse it — says which one broke, and prints the week it would render. A 404
+means the address was reset, a sign-in page means it's the public URL rather
+than the secret one, and a clean pass means the feed is fine and the problem
+is the collector not running. It never prints the URL itself, only a masked
+form.
+
 ## Google ↔ Outlook two-way sync (`calendar_sync.py`)
 
 Standalone from the dashboard. The Calendar panel above *reads* an ICS feed
@@ -295,7 +308,7 @@ than only the file that changed.
 python -m pytest
 ```
 
-261 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
+271 tests, no display needed (Qt runs offscreen via `tests/conftest.py`).
 They cover the org datetree round-trip, the JSON stores, iCal parsing
 (recurrence, all-day spans, timezones), the sync engine (loop prevention,
 conflict resolution, dry runs, first-run reconciliation) and the widget's

@@ -283,3 +283,91 @@ def test_garbled_feed_is_reported_not_raised(monkeypatch):
 
     assert "error" in payload
     assert len(payload["days"]) == 7
+
+
+# ── the diagnostic, and keeping the secret out of logs ───────────────
+
+def test_the_url_is_masked_for_printing():
+    masked = calendar_feed.mask_url(
+        "https://calendar.google.com/calendar/ical/joey%40x.com/private-abc123def/basic.ics")
+
+    assert "private-abc123def" not in masked
+    assert "joey%40x.com" not in masked
+    assert masked.startswith("https://calendar.google.com/calendar/ical/")
+    assert masked.endswith("basic.ics")
+
+
+def test_a_fetch_error_never_carries_the_secret(monkeypatch):
+    """requests puts the whole URL in its error text, and that text is
+    printed, stored in cache.json and shown in the panel."""
+    secret = "https://calendar.google.com/calendar/ical/private-sssh/basic.ics"
+
+    def explode(*a, **k):
+        raise RuntimeError(f"404 Client Error for url: {secret}")
+
+    monkeypatch.setattr(calendar_feed, "FETCH_ATTEMPTS", 1)
+    monkeypatch.setattr(calendar_feed.requests, "get", explode)
+
+    with pytest.raises(RuntimeError) as caught:
+        calendar_feed.fetch_ics(secret)
+
+    assert "private-sssh" not in str(caught.value)
+    assert "404" in str(caught.value)
+
+
+def test_the_error_stored_in_the_cache_is_scrubbed(monkeypatch):
+    secret = "https://calendar.google.com/calendar/ical/private-sssh/basic.ics"
+    monkeypatch.setattr(calendar_feed, "ICAL_URL", secret)
+    monkeypatch.setattr(calendar_feed, "FETCH_ATTEMPTS", 1)
+    monkeypatch.setattr(calendar_feed.requests, "get",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            RuntimeError(f"boom for url: {secret}")))
+
+    payload = calendar_feed.collect_calendar(today=THAT_WEEK)
+
+    assert "private-sssh" not in payload["error"]
+
+
+def test_resolve_reports_where_the_url_came_from(monkeypatch, tmp_path):
+    monkeypatch.setattr(calendar_feed, "ICAL_URL", "https://example.com/a.ics")
+    url, source = calendar_feed.resolve_url_with_source()
+    assert url == "https://example.com/a.ics"
+    assert "calendar_feed.py" in source
+
+    path = tmp_path / "calendar_url.txt"
+    path.write_text("https://example.com/b.ics", encoding="utf-8")
+    monkeypatch.setattr(calendar_feed, "ICAL_URL", calendar_feed.PLACEHOLDER)
+    monkeypatch.setattr(calendar_feed, "ICAL_URL_PATH", path)
+    url, source = calendar_feed.resolve_url_with_source()
+    assert url == "https://example.com/b.ics"
+    assert source == str(path)
+
+
+def test_the_diagnostic_reports_a_missing_url(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(calendar_feed, "ICAL_URL", calendar_feed.PLACEHOLDER)
+    monkeypatch.setattr(calendar_feed, "ICAL_URL_PATH", tmp_path / "none.txt")
+
+    assert calendar_feed.check() == 1
+    assert "NOT SET" in capsys.readouterr().out
+
+
+def test_the_diagnostic_passes_on_a_good_feed(monkeypatch, capsys):
+    monkeypatch.setattr(calendar_feed, "ICAL_URL", "https://example.com/f.ics")
+    monkeypatch.setattr(calendar_feed, "fetch_ics",
+                        lambda url: ics(timed("standup", "20260811T090000",
+                                              "20260811T091500")))
+
+    assert calendar_feed.check() == 0
+    out = capsys.readouterr().out
+    assert "fetch ... ok" in out
+    assert "parse ... ok" in out
+
+
+def test_the_diagnostic_explains_a_404(monkeypatch, capsys):
+    monkeypatch.setattr(calendar_feed, "ICAL_URL", "https://example.com/f.ics")
+    monkeypatch.setattr(calendar_feed, "fetch_ics",
+                        lambda url: (_ for _ in ()).throw(
+                            RuntimeError("404 Client Error")))
+
+    assert calendar_feed.check() == 1
+    assert "Reset" in capsys.readouterr().out

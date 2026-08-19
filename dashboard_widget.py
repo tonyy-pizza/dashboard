@@ -190,6 +190,11 @@ def _ago(iso_str):
     return f"{int(seconds // 86400)}d ago"
 
 
+def _monday_of_today() -> str:
+    today = dt.date.today()
+    return (today - dt.timedelta(days=today.weekday())).isoformat()
+
+
 def _parse_local(iso_str):
     """The collector writes `generated_at` as a naive local timestamp."""
     if not iso_str:
@@ -1953,6 +1958,20 @@ class DashboardWidget(QWidget):
             self.calendar_hint.show()
         elif data.get("error"):
             self.calendar_hint.setText(f"unavailable: {soft_wrap(data['error'])}")
+            self.calendar_hint.show()
+        elif not data.get("days"):
+            # No calendar section in cache.json at all. Without this the panel
+            # draws an empty week and says nothing, which reads as "the
+            # calendar stopped working" rather than "nothing has fetched yet".
+            self.calendar_hint.setText(
+                "no calendar data yet — run: py collector.py   "
+                "(or: py calendar_feed.py to test the feed)")
+            self.calendar_hint.show()
+        elif start and start != _monday_of_today():
+            # A cached week that isn't this one means the collector hasn't run
+            # since it rolled over; the grid below is last week's.
+            self.calendar_hint.setText(
+                f"showing the week of {start} — the collector hasn't run since")
             self.calendar_hint.show()
         else:
             self.calendar_hint.hide()

@@ -411,7 +411,46 @@ def test_cache_renders_into_the_read_only_panels(widget):
     assert widget.greed_score.text() == "62"
     assert "+7 vs. yesterday" == widget.greed_delta._full_text
     assert "last sync" in widget.status_label._full_text
-    assert widget.calendar_hint.isVisible() is False
+    assert widget.calendar_hint.isVisibleTo(widget) is False
+
+
+def test_a_cache_with_no_calendar_section_says_so(widget):
+    """Otherwise the panel draws a blank week and looks broken."""
+    write_cache({"generated_at": "2026-08-17T09:30:00", "weather": {},
+                 "greed": {}, "sectors": {}})
+
+    widget._load_cache()
+
+    assert widget.calendar_hint.isVisibleTo(widget) is True
+    assert "no calendar data yet" in widget.calendar_hint.text()
+
+
+def test_a_calendar_from_last_week_is_called_out(widget):
+    stale_monday = (dt.date.today() - dt.timedelta(days=dt.date.today().weekday())
+                    - dt.timedelta(days=7))
+    write_cache({"generated_at": "2026-08-17T09:30:00",
+                 "calendar": {"week_start": stale_monday.isoformat(),
+                              "week_end": (stale_monday + dt.timedelta(days=6)).isoformat(),
+                              "days": [{"date": (stale_monday + dt.timedelta(days=i)).isoformat(),
+                                        "events": []} for i in range(7)]}})
+
+    widget._load_cache()
+
+    assert widget.calendar_hint.isVisibleTo(widget) is True
+    assert "hasn't run since" in widget.calendar_hint.text()
+
+
+def test_the_current_week_shows_no_notice(widget):
+    monday = dt.date.today() - dt.timedelta(days=dt.date.today().weekday())
+    write_cache({"generated_at": "2026-08-17T09:30:00",
+                 "calendar": {"week_start": monday.isoformat(),
+                              "week_end": (monday + dt.timedelta(days=6)).isoformat(),
+                              "days": [{"date": (monday + dt.timedelta(days=i)).isoformat(),
+                                        "events": []} for i in range(7)]}})
+
+    widget._load_cache()
+
+    assert widget.calendar_hint.isVisibleTo(widget) is False
 
 
 def test_calendar_setup_notice_is_shown(widget):

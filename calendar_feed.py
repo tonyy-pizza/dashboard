@@ -15,6 +15,8 @@ Runs inside collector.py so the widget keeps its single data source
 """
 
 import datetime as dt
+import re
+import sys
 import time
 from pathlib import Path
 
@@ -65,7 +67,14 @@ def resolve_url() -> str:
     """The feed URL from ICAL_URL, else the first usable line of
     calendar_url.txt. webcal:// is rewritten to https:// — some calendar UIs
     hand out the URL in that form and requests can't fetch it."""
-    for candidate in (ICAL_URL, _url_from_file()):
+    return resolve_url_with_source()[0]
+
+
+def resolve_url_with_source():
+    """(url, where it came from) — the diagnostic wants to name the source."""
+    sources = ((ICAL_URL, "ICAL_URL in calendar_feed.py"),
+               (_url_from_file(), str(ICAL_URL_PATH)))
+    for candidate, source in sources:
         url = (candidate or "").strip().strip('"').strip("'")
         if not url or PLACEHOLDER in url:
             continue
@@ -74,8 +83,24 @@ def resolve_url() -> str:
         if not url.startswith(("http://", "https://")):
             raise CalendarSetupNeeded(
                 f"calendar URL doesn't look like a link: {url[:40]}…")
-        return url
+        return url, source
     raise CalendarSetupNeeded("no iCal URL set yet")
+
+
+def mask_url(url: str) -> str:
+    """A URL safe to print. The path segments are the secret — anyone with
+    the whole thing can read the calendar."""
+    match = re.match(r"^(https?://[^/]+)(/.*)?$", url or "")
+    if not match:
+        return "(unreadable)"
+    host, path = match.group(1), match.group(2) or ""
+    segments = []
+    for segment in path.split("/"):
+        if not segment or segment in ("calendar", "ical", "basic.ics"):
+            segments.append(segment)
+        else:
+            segments.append(f"{segment[:3]}…{len(segment)} chars")
+    return host + "/".join(segments)
 
 
 def _url_from_file():
@@ -88,6 +113,14 @@ def _url_from_file():
         if line and not line.startswith("#"):
             return line
     return ""
+
+
+def scrub(message, url: str) -> str:
+    """Keep the secret out of logs. requests puts the whole URL in its error
+    text, and that text ends up printed, written into cache.json's error
+    field, and shown in the panel."""
+    text = str(message)
+    return text.replace(url, mask_url(url)) if url else text
 
 
 def fetch_ics(url: str) -> str:
@@ -109,8 +142,8 @@ def fetch_ics(url: str) -> str:
                 raise ValueError("response wasn't an iCal feed — check the URL")
             return text
         except Exception as e:
-            last_error = e
-            print(f"[calendar] Attempt {attempt + 1} failed: {e}")
+            last_error = scrub(e, url)
+            print(f"[calendar] Attempt {attempt + 1} failed: {last_error}")
     raise RuntimeError(str(last_error))
 
 
@@ -212,3 +245,88 @@ def _to_local(moment: dt.datetime, tz=None) -> dt.datetime:
         return moment.astimezone(tz)
     except (ValueError, OSError):
         return moment
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Diagnostic: py calendar_feed.py
+# ─────────────────────────────────────────────────────────────────────
+
+def check() -> int:
+    """Answer "is it my URL or the script?" in one command.
+
+    Walks the same three steps the collector does — find the URL, fetch it,
+    parse it — and says which one broke. Never prints the URL itself.
+    """
+    print("checking the calendar feed\n")
+
+    try:
+        url, source = resolve_url_with_source()
+    except CalendarSetupNeeded as e:
+        print(f"  url ..... NOT SET ({e})\n")
+        print("  no URL to test. Put your secret iCal address in one of:")
+        for i, step in enumerate(SETUP_STEPS, 1):
+            print(f"    {i}. {step}")
+        return 1
+    print(f"  url ..... found in {source}")
+    print(f"            {mask_url(url)}")
+
+    try:
+        ics_text = fetch_ics(url)
+    except Exception as e:
+        print(f"  fetch ... FAILED — {e}\n")
+        print("  " + _fetch_advice(str(e)))
+        return 1
+    print(f"  fetch ... ok, {len(ics_text) / 1024:.1f} KB")
+
+    payload = collect_calendar(ics_text=ics_text)
+    if payload.get("error"):
+        print(f"  parse ... FAILED — {payload['error']}")
+        return 1
+
+    total = ics_text.count("BEGIN:VEVENT")
+    this_week = sum(len(day["events"]) for day in payload["days"])
+    print(f"  parse ... ok, {total} events in the feed, "
+          f"{this_week} in the week of {payload['week_start']}\n")
+
+    for day in payload["days"]:
+        events = day["events"] or []
+        listed = ", ".join(
+            (e["summary"] if e["all_day"] else f"{e['start']} {e['summary']}")
+            for e in events) or "—"
+        print(f"    {day['date']}  {listed}")
+
+    if total and not this_week:
+        print("\n  The feed parsed but has nothing in the current week. That's "
+              "normal for a\n  quiet week — check a date above against Google "
+              "to be sure it's the right\n  calendar.")
+    elif not total:
+        print("\n  The feed is valid but contains no events at all — most "
+              "likely the address\n  of an empty or wrong calendar.")
+    else:
+        print("\n  Feed is fine. If the panel still looks stale, the collector "
+              "isn't running:\n  run `py collector.py` and check the last sync "
+              "time in the dashboard.")
+    return 0
+
+
+def _fetch_advice(error: str) -> str:
+    error = error.lower()
+    if "404" in error:
+        return ("404 means the address doesn't exist. Google invalidates the "
+                "secret address\n  when you press Reset — copy it again from "
+                "Integrate calendar.")
+    if "401" in error or "403" in error:
+        return ("Access denied. That's usually the *public* URL or a calendar "
+                "that isn't\n  shared — use the 'Secret address in iCal "
+                "format', which ends in /basic.ics.")
+    if "wasn't an ical feed" in error:
+        return ("The server answered with something that isn't a calendar — "
+                "usually a sign-in\n  page, which means the URL isn't the "
+                "secret one.")
+    if "name or service not known" in error or "connection" in error:
+        return "Couldn't reach the server at all — network or firewall."
+    return "Check the address, then try opening it in a browser."
+
+
+if __name__ == "__main__":
+    sys.exit(check())
