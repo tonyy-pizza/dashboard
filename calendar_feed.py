@@ -27,6 +27,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 
@@ -60,6 +61,28 @@ PIP_HINT = "pip install icalendar recurring-ical-events"
 FETCH_ATTEMPTS = 3
 FETCH_TIMEOUT = 30
 MAX_EVENTS = 500
+
+# The detail popup carries the invite text into cache.json, and an Outlook
+# invite body runs to kilobytes. Cap both — the panel shows a summary, not
+# the whole thread.
+MAX_DESCRIPTION = 1200
+MAX_ATTENDEES = 12
+
+# Conferencing hosts the join button knows how to name, most specific first.
+MEETING_HOSTS = (
+    ("teams.microsoft.com", "Teams"), ("teams.live.com", "Teams"),
+    ("meet.google.com", "Meet"), ("zoom.us", "Zoom"),
+    ("webex.com", "Webex"), ("gotomeeting.com", "GoToMeeting"),
+    ("whereby.com", "Whereby"), ("chime.aws", "Chime"),
+    ("bluejeans.com", "BlueJeans"), ("meet.jit.si", "Jitsi"),
+)
+
+# Angle brackets and quotes end a URL — Outlook writes its join link as
+# "Click here to join the meeting<https://teams.microsoft.com/...>".
+_URL_RE = re.compile(r"https?://[^\s<>\"']+")
+
+# The rule of underscores Outlook staples above its join block.
+_JOIN_BLOCK_RE = re.compile(r"\n?_{20,}\n.*", re.S)
 
 
 class CalendarSetupNeeded(Exception):
@@ -249,24 +272,36 @@ def _spread_event(occurrence, monday, sunday, tz=None):
     """One occurrence → (iso date, event dict) per day it covers inside the
     week. All-day events carry an exclusive DTEND, so a Fri→Mon event ends on
     the Sunday. Timed events are listed on the day they start."""
-    summary = _text(occurrence.get("SUMMARY")) or "(no title)"
-    location = _text(occurrence.get("LOCATION"))
     start = _value(occurrence.get("DTSTART"))
     end = _value(occurrence.get("DTEND"))
 
     if start is None:
         return
 
+    url, service = _meeting_link(occurrence)
+    # Everything the detail popup shows. The grid only reads summary/start,
+    # so the rest rides along untouched until someone clicks.
+    details = {
+        "summary": _text(occurrence.get("SUMMARY")) or "(no title)",
+        "location": _text(occurrence.get("LOCATION")),
+        "description": _clean_description(_text(occurrence.get("DESCRIPTION"))),
+        "organizer": _person(occurrence.get("ORGANIZER")),
+        "attendees": _attendees(occurrence),
+        "attendee_count": _attendee_count(occurrence),
+        "meeting_url": url,
+        "meeting_service": service,
+        "status": _text(occurrence.get("STATUS")).upper(),
+    }
+
     if isinstance(start, dt.datetime):
         start = _to_local(start, tz)
         end = _to_local(end, tz) if isinstance(end, dt.datetime) else None
-        yield start.date().isoformat(), {
-            "summary": summary,
-            "location": location,
-            "start": start.strftime("%H:%M"),
-            "end": end.strftime("%H:%M") if end else None,
-            "all_day": False,
-        }
+        yield start.date().isoformat(), dict(
+            details,
+            start=start.strftime("%H:%M"),
+            end=end.strftime("%H:%M") if end else None,
+            all_day=False,
+        )
         return
 
     # date (not datetime) → an all-day event
@@ -275,9 +310,105 @@ def _spread_event(occurrence, monday, sunday, tz=None):
         last = max(start, end - dt.timedelta(days=1))
     day = max(start, monday)
     while day <= min(last, sunday):
-        yield day.isoformat(), {"summary": summary, "location": location,
-                                "start": None, "end": None, "all_day": True}
+        yield day.isoformat(), dict(details, start=None, end=None, all_day=True)
         day += dt.timedelta(days=1)
+
+
+def _meeting_link(occurrence):
+    """(url, service) for the popup's join button.
+
+    Only ever returns http(s): the widget hands this straight to the browser,
+    and an invite is written by whoever sent it, not by us.
+    """
+    # Providers that name the link outright beat guessing from prose.
+    for key in ("X-MICROSOFT-SKYPETEAMSMEETINGURL", "X-GOOGLE-CONFERENCE",
+                "CONFERENCE", "URL"):
+        for candidate in _property_values(occurrence, key):
+            url = _safe_url(candidate)
+            if url:
+                return url, _service_name(url)
+
+    # Otherwise the first conferencing link in the text Outlook pastes in.
+    text = "\n".join((_text(occurrence.get("LOCATION")),
+                      _text(occurrence.get("DESCRIPTION"))))
+    links = [u for u in (_safe_url(m) for m in _URL_RE.findall(text)) if u]
+    for url in links:
+        if _service_name(url):
+            return url, _service_name(url)
+    # A bare link with no recognisable host is still worth offering.
+    return (links[0], "") if links else ("", "")
+
+
+def _property_values(occurrence, key):
+    """icalendar hands back a bare value for one instance of a property and a
+    list for several — CONFERENCE legitimately repeats."""
+    value = occurrence.get(key)
+    if value is None:
+        return []
+    return [str(v) for v in (value if isinstance(value, list) else [value])]
+
+
+def _safe_url(candidate) -> str:
+    """A URL safe to hand to the browser, or "". Anything that isn't plain
+    http(s) is dropped: file:// and friends reach the local machine, and the
+    feed is not a trusted source."""
+    url = str(candidate or "").strip().strip("<>").rstrip(".,;:!)\u2019\"'")
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return ""
+    if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+        return ""
+    return url
+
+
+def _service_name(url: str) -> str:
+    host = urlsplit(url).hostname or ""
+    for suffix, label in MEETING_HOSTS:
+        if host == suffix or host.endswith("." + suffix):
+            return label
+    return ""
+
+
+def _clean_description(text: str) -> str:
+    """Outlook staples a join block onto the end of every invite. Its link is
+    already on the button, so drop the block and keep what a person wrote —
+    unless that was the whole body, in which case keep it rather than show
+    an empty popup."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    trimmed = _JOIN_BLOCK_RE.sub("", text).strip()
+    text = re.sub(r"\n{3,}", "\n\n", (trimmed or text).strip())
+    if len(text) > MAX_DESCRIPTION:
+        text = text[:MAX_DESCRIPTION].rstrip() + "…"
+    return text
+
+
+def _person(field) -> str:
+    """'Dana Whitfield' from the CN parameter, else the bare address."""
+    if field is None:
+        return ""
+    name = ""
+    if hasattr(field, "params"):
+        name = str(field.params.get("CN", "")).strip().strip('"')
+    return name or re.sub(r"^mailto:", "", str(field), flags=re.I).strip()
+
+
+def _attendee_count(occurrence) -> int:
+    """The real total, so a capped list can still say "and 40 others"."""
+    field = occurrence.get("ATTENDEE")
+    if field is None:
+        return 0
+    return len(field) if isinstance(field, list) else 1
+
+
+def _attendees(occurrence):
+    """Invitee names for the popup, capped. A big distribution list would
+    otherwise put hundreds of addresses into cache.json."""
+    field = occurrence.get("ATTENDEE")
+    if field is None:
+        return []
+    people = [_person(a) for a in (field if isinstance(field, list) else [field])]
+    return [p for p in people if p][:MAX_ATTENDEES]
 
 
 def _value(field):
@@ -286,6 +417,14 @@ def _value(field):
 
 
 def _text(field):
+    """First value as a string.
+
+    A feed may carry the same property twice — icalendar hands back a list
+    when it does, and str() on that list would land in the panel verbatim as
+    "[vText(b'CANCELLED'), vText(b'CONFIRMED')]".
+    """
+    if isinstance(field, list):
+        field = field[0] if field else None
     return str(field).strip() if field is not None else ""
 
 

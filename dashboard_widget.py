@@ -45,9 +45,11 @@ from pathlib import Path
 
 from PyQt6.QtCore import (
     QEvent, QFileSystemWatcher, QMimeData, QObject, QPoint, QPointF, QRect,
-    QRectF, Qt, QTimer, pyqtSignal,
+    QRectF, Qt, QTimer, QUrl, pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QDrag, QFont, QPainter, QPen, QPolygonF
+from PyQt6.QtGui import (
+    QColor, QDesktopServices, QDrag, QFont, QPainter, QPen, QPolygonF,
+)
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDoubleSpinBox, QFrame, QHBoxLayout,
     QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
@@ -1165,6 +1167,205 @@ class JournalHistoryDialog(QDialog):
 # Calendar week grid
 # ─────────────────────────────────────────────────────────────────────────
 
+def safe_link(value) -> str:
+    """An event's join link, or "" if it isn't plainly http(s).
+
+    QDesktopServices hands a URL to the OS, which will happily act on
+    file:// or a registered app scheme. The link is written by whoever sent
+    the invite, so it gets checked here and again at the moment of the click.
+    """
+    url = QUrl(str(value or "").strip())
+    if not url.isValid() or not url.host():
+        return ""
+    if url.scheme().lower() not in ("http", "https"):
+        return ""
+    return url.toString()
+
+
+def event_status(event) -> str:
+    """CANCELLED / TENTATIVE / CONFIRMED / "". Read through str(): cache.json
+    is a file on disk, and a stale or hand-edited one shouldn't be able to
+    take the panel down with a value of the wrong type."""
+    return str((event or {}).get("status") or "").upper()
+
+
+class EventDialog(QDialog):
+    """Everything the invite carries, one click off the week grid.
+
+    A grid cell is four words wide, so the join link, the organizer and the
+    agenda have to live behind a click. Every field here is written by
+    whoever sent the invite: labels are PlainText for the same reason the
+    grid rows are, and the body goes through QPlainTextEdit, which has no
+    rich-text mode to abuse.
+    """
+
+    def __init__(self, event, date, scaler, body_family, title_family, parent=None):
+        super().__init__(parent)
+        self._event = event or {}
+        self._scaler = scaler
+        self._body = body_family
+        self.setWindowTitle("event")
+        self.setStyleSheet(theme.dialog_style(body_family))
+        self.setMinimumWidth(430)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(9)
+
+        heading = QLabel(str(self._event.get("summary") or "(no title)"))
+        heading.setTextFormat(Qt.TextFormat.PlainText)
+        heading.setWordWrap(True)
+        heading.setStyleSheet(f"color: {CREAM}; background: transparent;")
+        scaler.font(title_family, theme.TITLE_PX, register=heading)
+        layout.addWidget(heading)
+
+        when = QLabel(self._when(date))
+        when.setStyleSheet(f"color: {CHROME}; background: transparent;")
+        scaler.font(body_family, theme.BODY_PX, tabular_nums=True, register=when)
+        layout.addWidget(when)
+
+        status = event_status(self._event)
+        if status in ("CANCELLED", "TENTATIVE"):
+            flag = QLabel("cancelled" if status == "CANCELLED" else "tentative")
+            flag.setStyleSheet(f"color: {FAINT}; background: transparent;")
+            scaler.font(body_family, theme.CAPTION_PX, register=flag)
+            layout.addWidget(flag)
+
+        for name, value in (("where", self._event.get("location")),
+                            ("from", self._event.get("organizer")),
+                            ("with", self._guests())):
+            if value:
+                layout.addWidget(self._field(name, value))
+
+        url = safe_link(self._event.get("meeting_url"))
+        if url:
+            layout.addLayout(self._join_row(url))
+
+        body = str(self._event.get("description") or "").strip()
+        if body:
+            layout.addWidget(self._body_view(body), 1)
+
+        close = QPushButton("close")
+        close.setStyleSheet(theme.button_style(body_family))
+        close.clicked.connect(self.accept)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(close)
+        layout.addLayout(row)
+
+    def _when(self, date) -> str:
+        day = f"{DAYS_SHORT[date.weekday()]} {date.day} {MONTHS_SHORT[date.month - 1]}"
+        if self._event.get("all_day"):
+            return f"{day} · all day"
+        start, end = self._event.get("start"), self._event.get("end")
+        if start and end:
+            return f"{day} · {start}–{end}"
+        return f"{day} · {start}" if start else day
+
+    def _guests(self) -> str:
+        """The feed caps the guest list, so say how many were left out rather
+        than quietly showing twelve of forty."""
+        names = [str(n) for n in (self._event.get("attendees") or []) if n]
+        if not names:
+            return ""
+        hidden = (self._event.get("attendee_count") or len(names)) - len(names)
+        return ", ".join(names) + (f" and {hidden} more" if hidden > 0 else "")
+
+    def _field(self, name, value):
+        holder = QWidget()
+        holder.setStyleSheet("background: transparent;")
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        row.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        key = QLabel(name)
+        key.setFixedWidth(42)
+        key.setStyleSheet(f"color: {FAINT}; background: transparent;")
+        self._scaler.font(self._body, theme.CAPTION_PX, register=key)
+        row.addWidget(key)
+
+        text = QLabel(str(value))
+        text.setTextFormat(Qt.TextFormat.PlainText)
+        text.setWordWrap(True)
+        text.setStyleSheet(f"color: {CREAM_DIM}; background: transparent;")
+        self._scaler.font(self._body, theme.CAPTION_PX, register=text)
+        row.addWidget(text, 1)
+        return holder
+
+    def _join_row(self, url):
+        service = (self._event.get("meeting_service") or "").strip()
+        join = QPushButton(f"join {service.lower()}" if service else "open link")
+        join.setStyleSheet(theme.button_style(self._body))
+        join.setCursor(Qt.CursorShape.PointingHandCursor)
+        join.clicked.connect(lambda: self._open(url))
+
+        copy = QPushButton("copy")
+        copy.setStyleSheet(theme.button_style(self._body))
+        copy.setCursor(Qt.CursorShape.PointingHandCursor)
+        copy.setToolTip("copy the link to the clipboard")
+        copy.clicked.connect(lambda: QApplication.clipboard().setText(url))
+
+        # Name the host. An unrecognised link is still offered — it may be a
+        # perfectly good internal bridge — and the host is what tells you.
+        host = QLabel(QUrl(url).host())
+        host.setTextFormat(Qt.TextFormat.PlainText)
+        host.setStyleSheet(f"color: {FAINT}; background: transparent;")
+        self._scaler.font(self._body, theme.SMALL_PX, register=host)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(join)
+        row.addWidget(copy)
+        row.addWidget(host, 1)
+        return row
+
+    def _body_view(self, text):
+        view = QPlainTextEdit(text)
+        view.setReadOnly(True)
+        view.setFrameShape(QFrame.Shape.NoFrame)
+        view.setStyleSheet(theme.input_style(self._body) + theme.scrollbar_style())
+        view.setMinimumHeight(96)
+        self._scaler.font(self._body, theme.CAPTION_PX, register=view)
+        return view
+
+    def _open(self, url):
+        # Checked again here, not only when the panel was built: cache.json is
+        # a file on disk, and this call reaches the desktop's URL handler.
+        target = safe_link(url)
+        if target:
+            QDesktopServices.openUrl(QUrl(target))
+
+
+class EventLabel(ElidedLabel):
+    """A grid row that answers a click. Same eliding as before, plus a hover
+    state — nothing else in the panel is clickable, so it has to look it."""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, text="", cancelled=False, parent=None):
+        super().__init__(text, parent)
+        self._resting = FAINT if cancelled else CREAM
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._paint(self._resting, "transparent")
+
+    def _paint(self, color, background):
+        self.setStyleSheet(f"color: {color}; background: {background};")
+
+    def enterEvent(self, event):
+        self._paint(WHITE, HOVER)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._paint(self._resting, "transparent")
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
 class WeekGrid(QWidget):
     """Read-only mini grid of the current week — one column per day."""
 
@@ -1219,7 +1420,7 @@ class WeekGrid(QWidget):
 
         events = day.get("events") or []
         for event in events[:self.MAX_EVENTS]:
-            layout.addWidget(self._event_label(event))
+            layout.addWidget(self._event_label(event, date))
         if len(events) > self.MAX_EVENTS:
             more = QLabel(f"+{len(events) - self.MAX_EVENTS} more")
             more.setStyleSheet(f"color: {FAINT}; background: transparent;")
@@ -1233,32 +1434,42 @@ class WeekGrid(QWidget):
         layout.addStretch()
         return column
 
-    def _event_label(self, event):
-        summary = event.get("summary", "(no title)")
+    def _event_label(self, event, date):
+        summary = str(event.get("summary") or "(no title)")
         start = event.get("start")
         text = summary if event.get("all_day") or not start else f"{start} {summary}"
-        label = ElidedLabel(text)
+        cancelled = event_status(event) == "CANCELLED"
+        label = EventLabel(text, cancelled=cancelled)
         # Event titles come from the calendar feed, not from us. QLabel's
         # AutoText would render anything that looks like HTML — including
         # <img src="http://…">, which would phone home on every refresh.
         label.setTextFormat(Qt.TextFormat.PlainText)
         label.setToolTip(self._tooltip(event))
-        label.setStyleSheet(f"color: {CREAM}; background: transparent;")
+        label.clicked.connect(lambda _=False, e=event, d=date: self._open_event(e, d))
         self._scaler.font(self._body, theme.CAPTION_PX, tabular_nums=True, register=label)
         return label
 
+    def _open_event(self, event, date):
+        EventDialog(event, date, self._scaler, self._body, self._title,
+                    self.window()).exec()
+
     @staticmethod
     def _tooltip(event):
-        parts = [event.get("summary", "")]
+        parts = [str(event.get("summary") or "")]
         if event.get("all_day"):
             parts.append("all day")
         elif event.get("start"):
-            span = event["start"]
+            span = str(event["start"])
             if event.get("end"):
                 span += f"–{event['end']}"
             parts.append(span)
         if event.get("location"):
-            parts.append(event["location"])
+            parts.append(str(event["location"]))
+        if event_status(event) == "CANCELLED":
+            parts.append("cancelled")
+        if event.get("meeting_url"):
+            parts.append(f"{event.get('meeting_service') or 'meeting'} link")
+        parts.append("click for details")
         return " · ".join(p for p in parts if p)
 
 
