@@ -1,5 +1,7 @@
 """Calendar — read-only week view built from a published iCal URL.
 
+The grid runs Sunday→Saturday and pages a few weeks either side of today.
+
 No OAuth, no consent screen, no credentials.json/token.json, no google-* or
 msal packages. The collector fetches one .ics file over HTTPS and parses it,
 which works with any provider that publishes a private iCal address.
@@ -60,7 +62,14 @@ PIP_HINT = "pip install icalendar recurring-ical-events"
 
 FETCH_ATTEMPTS = 3
 FETCH_TIMEOUT = 30
-MAX_EVENTS = 500
+# The widget never fetches, so every week it can page to has to already be
+# in cache.json. This window is what the panel's ‹ › buttons move within;
+# widen it here and the buttons reach further, at the cost of cache size
+# (a busy week of Teams invites is roughly 20 KB).
+WEEKS_BACK = 2
+WEEKS_AHEAD = 6
+
+MAX_EVENTS = 1200
 
 # The detail popup carries the invite text into cache.json, and an Outlook
 # invite body runs to kilobytes. Cap both — the panel shows a summary, not
@@ -90,10 +99,13 @@ class CalendarSetupNeeded(Exception):
 
 
 def week_bounds(today=None):
-    """(Monday, Sunday) of the week containing `today`."""
+    """(Sunday, Saturday) of the week containing `today`."""
     today = today or dt.date.today()
-    monday = today - dt.timedelta(days=today.weekday())
-    return monday, monday + dt.timedelta(days=6)
+    # weekday() is Mon=0 … Sun=6, so (weekday + 1) % 7 is days since Sunday
+    # — and 0 when today *is* Sunday, which is the case a plain subtraction
+    # of weekday() gets wrong.
+    sunday = today - dt.timedelta(days=(today.weekday() + 1) % 7)
+    return sunday, sunday + dt.timedelta(days=6)
 
 
 def _ical_modules():
@@ -209,19 +221,34 @@ def fetch_ics(url: str) -> str:
 
 
 def collect_calendar(today=None, ics_text=None, tz=None) -> dict:
-    """This week's events, shaped for the week grid.
+    """A window of Sunday→Saturday weeks, shaped for the week grid.
+
+    "weeks" holds every week the panel can page to, WEEKS_BACK before this
+    one through WEEKS_AHEAD after it, and "current_week" indexes the one
+    containing today. The current week is also repeated at the top level as
+    "days"/"week_start"/"week_end", so a panel that predates paging still
+    finds it where it always was.
 
     Never raises: a missing URL, a missing parser or a failed fetch all come
     back as a payload the panel can render. Pass `ics_text` to parse a feed
     you already have, and `tz` to render times somewhere other than the
     machine's own timezone (both used by the tests).
     """
-    monday, sunday = week_bounds(today)
+    start, end = week_bounds(today)
+    weeks = [_empty_week(start + dt.timedelta(weeks=offset))
+             for offset in range(-WEEKS_BACK, WEEKS_AHEAD + 1)]
+    current = WEEKS_BACK
+    first_day = dt.date.fromisoformat(weeks[0]["week_start"])
+    last_day = dt.date.fromisoformat(weeks[-1]["week_end"])
     payload = {
-        "week_start": monday.isoformat(),
-        "week_end": sunday.isoformat(),
-        "days": [{"date": (monday + dt.timedelta(days=i)).isoformat(), "events": []}
-                 for i in range(7)],
+        # The current week stays at the top level: a cache written by an
+        # older collector has no "weeks", and a panel that only knows about
+        # the top level still finds this week where it always was.
+        "week_start": start.isoformat(),
+        "week_end": end.isoformat(),
+        "days": weeks[current]["days"],
+        "weeks": weeks,
+        "current_week": current,
     }
 
     try:
@@ -232,7 +259,7 @@ def collect_calendar(today=None, ics_text=None, tz=None) -> dict:
         # between() expands RRULEs into real occurrences and applies EXDATE
         # and RECURRENCE-ID overrides; the end is exclusive, hence +1 day.
         occurrences = recurring_ical_events.of(calendar).between(
-            monday, sunday + dt.timedelta(days=1))
+            first_day, last_day + dt.timedelta(days=1))
         in_feed = len(calendar.walk("VEVENT"))
     except CalendarSetupNeeded as e:
         print(f"[calendar] Setup needed: {e}")
@@ -243,9 +270,10 @@ def collect_calendar(today=None, ics_text=None, tz=None) -> dict:
         payload.update(error=str(e))
         return payload
 
-    by_date = {day["date"]: day["events"] for day in payload["days"]}
+    by_date = {day["date"]: day["events"]
+               for week in weeks for day in week["days"]}
     for occurrence in list(occurrences)[:MAX_EVENTS]:
-        for date_key, event in _spread_event(occurrence, monday, sunday, tz):
+        for date_key, event in _spread_event(occurrence, first_day, last_day, tz):
             if date_key in by_date:
                 by_date[date_key].append(event)
 
@@ -263,15 +291,27 @@ def collect_calendar(today=None, ics_text=None, tz=None) -> dict:
                        notice="that address is a valid feed but holds no "
                               "events — most likely the wrong calendar")
 
-    print(f"[calendar] OK — {sum(len(v) for v in by_date.values())} events this week "
-          f"({in_feed} in the feed)")
+    this_week = sum(len(day["events"]) for day in payload["days"])
+    print(f"[calendar] OK — {this_week} events this week, "
+          f"{sum(len(v) for v in by_date.values())} across "
+          f"{len(weeks)} weeks ({in_feed} in the feed)")
     return payload
 
 
-def _spread_event(occurrence, monday, sunday, tz=None):
+def _empty_week(start) -> dict:
+    """One blank Sunday→Saturday block for the grid to fill."""
+    return {
+        "week_start": start.isoformat(),
+        "week_end": (start + dt.timedelta(days=6)).isoformat(),
+        "days": [{"date": (start + dt.timedelta(days=i)).isoformat(), "events": []}
+                 for i in range(7)],
+    }
+
+
+def _spread_event(occurrence, first_day, last_day, tz=None):
     """One occurrence → (iso date, event dict) per day it covers inside the
-    week. All-day events carry an exclusive DTEND, so a Fri→Mon event ends on
-    the Sunday. Timed events are listed on the day they start."""
+    window. All-day events carry an exclusive DTEND, so a Fri→Mon event ends
+    on the Sunday. Timed events are listed on the day they start."""
     start = _value(occurrence.get("DTSTART"))
     end = _value(occurrence.get("DTEND"))
 
@@ -308,8 +348,8 @@ def _spread_event(occurrence, monday, sunday, tz=None):
     last = start
     if isinstance(end, dt.date):
         last = max(start, end - dt.timedelta(days=1))
-    day = max(start, monday)
-    while day <= min(last, sunday):
+    day = max(start, first_day)
+    while day <= min(last, last_day):
         yield day.isoformat(), dict(details, start=None, end=None, all_day=True)
         day += dt.timedelta(days=1)
 
@@ -476,7 +516,13 @@ def check() -> int:
     total = payload.get("events_in_feed", 0)
     this_week = sum(len(day["events"]) for day in payload["days"])
     print(f"  parse ... ok, {total} events in the feed, "
-          f"{this_week} in the week of {payload['week_start']}\n")
+          f"{this_week} in the week of {payload['week_start']}")
+    weeks = payload.get("weeks") or []
+    if weeks:
+        windowed = sum(len(d["events"]) for w in weeks for d in w["days"])
+        print(f"            {windowed} across the {len(weeks)} weeks the panel "
+              f"can page to, {weeks[0]['week_start']} → {weeks[-1]['week_end']}")
+    print()
 
     for day in payload["days"]:
         events = day["events"] or []

@@ -192,9 +192,12 @@ def _ago(iso_str):
     return f"{int(seconds // 86400)}d ago"
 
 
-def _monday_of_today() -> str:
+def _week_start_of_today() -> str:
+    """Sunday of the current week. weekday() is Mon=0 … Sun=6, so
+    (weekday + 1) % 7 is days since Sunday — and 0 on a Sunday, which a
+    plain subtraction of weekday() gets wrong."""
     today = dt.date.today()
-    return (today - dt.timedelta(days=today.weekday())).isoformat()
+    return (today - dt.timedelta(days=(today.weekday() + 1) % 7)).isoformat()
 
 
 def _parse_local(iso_str):
@@ -1390,8 +1393,8 @@ class WeekGrid(QWidget):
         data = data or {}
         days = data.get("days") or []
         if not days:
-            monday = dt.date.today() - dt.timedelta(days=dt.date.today().weekday())
-            days = [{"date": (monday + dt.timedelta(days=i)).isoformat(), "events": []}
+            start = dt.date.fromisoformat(_week_start_of_today())
+            days = [{"date": (start + dt.timedelta(days=i)).isoformat(), "events": []}
                     for i in range(7)]
         for day in days:
             self._layout.addWidget(self._day_column(day), 1)
@@ -1529,6 +1532,8 @@ class DashboardWidget(QWidget):
         self.notes_edit = None          # stays None while SHOW_ROUGH_NOTES is off
         self.notes_caption = None
         self._cache_generated = None    # when the loaded cache.json was written
+        self._calendar_data = {}        # last calendar block read from the cache
+        self._week_offset = 0           # weeks from today's, moved by ‹ ›
 
         self.runner = CollectorRunner()
         self.runner.finished.connect(self._on_refresh_done)
@@ -2109,6 +2114,23 @@ class DashboardWidget(QWidget):
         self.scaler.font(self.body_font, theme.CAPTION_PX, register=self.sync_label)
         header.addWidget(self.sync_label)
 
+        # Paging moves within the weeks the collector already wrote — the
+        # widget still fetches nothing.
+        self.prev_week_btn = self._small_button(
+            "‹", lambda: self._step_week(-1), "previous week")
+        self.today_btn = self._small_button(
+            "today", self._show_current_week, "back to this week")
+        self.next_week_btn = self._small_button(
+            "›", lambda: self._step_week(1), "next week")
+        # The arrows sit at the ends of the window often enough that the stop
+        # has to be visible; theme.button_style carries no disabled state, so
+        # step the text down to the muted colour the rest of the panel uses.
+        dimmed = f"QPushButton:disabled {{ color: {FAINT}; border-color: {BORDER}; }}"
+        for button in (self.prev_week_btn, self.today_btn, self.next_week_btn):
+            button.setStyleSheet(button.styleSheet() + dimmed)
+            button.setEnabled(False)      # until a cache says otherwise
+            header.addWidget(button)
+
         self.calendar_hint = self._hint("", size=theme.SMALL_PX)
         self.calendar_hint.hide()
         layout.addWidget(self.calendar_hint)
@@ -2149,27 +2171,69 @@ class DashboardWidget(QWidget):
         self.sync_label.setText(text)
 
     def _render_calendar(self, data):
-        data = data or {}
-        self.week_grid.render(data)
-        start, end = data.get("week_start"), data.get("week_end")
-        if start and end:
-            try:
-                first, last = dt.date.fromisoformat(start), dt.date.fromisoformat(end)
-                self.calendar_caption.setText(
-                    f"{MONTHS_SHORT[first.month - 1]} {first.day} – "
-                    f"{MONTHS_SHORT[last.month - 1]} {last.day}")
-            except ValueError:
-                self.calendar_caption.setText("")
+        """Keep the whole calendar block; the panel pages inside it."""
+        self._calendar_data = data or {}
+        self._show_week()
 
+    def _step_week(self, delta):
+        self._week_offset += delta
+        self._show_week()
+
+    def _show_current_week(self):
+        self._week_offset = 0
+        self._show_week()
+
+    def _show_week(self):
+        data = self._calendar_data
+        weeks = data.get("weeks") or []
+        current = data.get("current_week") or 0
+
+        if weeks:
+            # Clamp rather than wrap. The window is however many weeks the
+            # collector wrote, and running off its end should stop dead —
+            # jumping to the far end would look like the grid glitched.
+            index = max(0, min(current + self._week_offset, len(weeks) - 1))
+            self._week_offset = index - current
+            week = weeks[index]
+        else:
+            # A cache written by an older collector holds a single week and
+            # no "weeks" list. Show it, and leave the arrows dead.
+            index, current, week = 0, 0, data
+            self._week_offset = 0
+
+        self.week_grid.render(week)
+        self._set_week_caption(week.get("week_start"), week.get("week_end"))
+        self.prev_week_btn.setEnabled(bool(weeks) and index > 0)
+        self.next_week_btn.setEnabled(bool(weeks) and index < len(weeks) - 1)
+        self.today_btn.setEnabled(self._week_offset != 0)
+        self._set_calendar_hint(data)
+
+    def _set_week_caption(self, start, end):
+        try:
+            first = dt.date.fromisoformat(start)
+            last = dt.date.fromisoformat(end)
+        except (TypeError, ValueError):
+            self.calendar_caption.setText("")
+            return
+        span = (f"{MONTHS_SHORT[first.month - 1]} {first.day} – "
+                f"{MONTHS_SHORT[last.month - 1]} {last.day}")
+        if self._week_offset:
+            plural = "" if abs(self._week_offset) == 1 else "s"
+            span += f"  ·  {self._week_offset:+d} week{plural}"
+        self.calendar_caption.setText(span)
+
+    def _set_calendar_hint(self, data):
+        # Always about the feed as a whole, never the week on screen: paging
+        # to a quiet week is not a problem worth a message.
+        collected_for = data.get("week_start")
         if data.get("needs_setup"):
             steps = data.get("setup_steps") or []
             self.calendar_hint.setText(
-                "google calendar isn't connected yet — one-time setup:  "
+                (data.get("notice") or "the calendar isn't connected yet")
+                + " — setup:  "
                 + "  ·  ".join(f"{i}. {step}" for i, step in enumerate(steps, 1)))
-            self.calendar_hint.show()
         elif data.get("error"):
             self.calendar_hint.setText(f"unavailable: {soft_wrap(data['error'])}")
-            self.calendar_hint.show()
         elif not data.get("days"):
             # No calendar section in cache.json at all. Without this the panel
             # draws an empty week and says nothing, which reads as "the
@@ -2177,15 +2241,16 @@ class DashboardWidget(QWidget):
             self.calendar_hint.setText(
                 "no calendar data yet — run: py collector.py   "
                 "(or: py calendar_feed.py to test the feed)")
-            self.calendar_hint.show()
-        elif start and start != _monday_of_today():
-            # A cached week that isn't this one means the collector hasn't run
-            # since it rolled over; the grid below is last week's.
+        elif collected_for and collected_for != _week_start_of_today():
+            # week_start is the week the collector ran in, whichever week the
+            # panel happens to be showing — so this still catches a rollover.
             self.calendar_hint.setText(
-                f"showing the week of {start} — the collector hasn't run since")
-            self.calendar_hint.show()
+                f"collected for the week of {collected_for} — "
+                "the collector hasn't run since")
         else:
             self.calendar_hint.hide()
+            return
+        self.calendar_hint.show()
 
     # ── panel: greed index ───────────────────────────────────────────
     def _build_greed_panel(self):
