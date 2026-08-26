@@ -1,7 +1,30 @@
 #!/usr/bin/env python3
 """
-Stock Investment Evaluator v5.3 — Compact Risk-Adjusted Edition
+Stock Investment Evaluator v5.3.1 — Compact Risk-Adjusted Edition
 Yahoo Finance via yfinance. Optimized for iPhone a-Shell.
+
+v5.3.1 changes vs v5.3 (accuracy fixes):
+- score() no longer returns a perfect 10 for negative ratios. A negative
+  P/E, EV/EBITDA, P/B or D/E means the denominator (earnings, EBITDA, book
+  equity) has gone negative, which is a disclosure and not a virtue. Those
+  inputs are now dropped and the surviving weights renormalize — the same
+  treatment an extreme PEG already received.
+- Negative book equity now raises a warning and its own risk flag. The old
+  "elevated leverage" test was `debt_eq > 1.0`, which a negative ratio can
+  never satisfy, so the most leveraged companies were flagged as clean.
+- FCF/Net Income is only scored when net income is positive. Two negatives
+  divided produced a spuriously healthy reading for companies that both
+  lose money and burn cash.
+- A debt-free balance sheet now scores 10 on interest coverage instead of
+  the neutral 5.0 used for missing data. No debt is the strongest possible
+  position on that metric, not an absent one.
+- PEG reads `trailingPegRatio` (falling back to `pegRatio`). Yahoo dropped
+  `pegRatio` from the standard modules, so every PEG code path — the
+  weighting branch, the display row, the warning and the risk flag — had
+  been inert.
+- Sector concentration needs at least 4 candidates and warns only on the
+  largest sector. Two tickers in two sectors are 50% each, so the best
+  possible pair used to draw two concentration warnings.
 
 v5.3 changes vs v5.2:
 - Adds value_screen(): a 52-week-low value flag. When a stock trades in the
@@ -99,6 +122,19 @@ def avg(values):
 def clamp(x, lo, hi):
     return None if x is None else max(lo, min(hi, x))
 
+def wavg(pairs, default=5.0):
+    """Weighted mean over (score, weight) pairs, skipping scores that came back
+    None (not interpretable) and renormalizing the weights that remain."""
+    kept = [(sc, w) for sc, w in pairs if sc is not None]
+    tw = sum(w for _, w in kept)
+    return sum(sc * w for sc, w in kept) / tw if tw > 0 else default
+
+def dim(scores, default=5.0):
+    """Mean of one dimension's sub-scores, skipping the ones that do not apply
+    to this company."""
+    v = avg(scores)
+    return default if v is None else v
+
 def fmt_money(v):
     if v is None: return "N/A"
     a = abs(v)
@@ -145,6 +181,12 @@ S_KEYS = ["pe_g","pe_b","peg_g","peg_b","ev_g","ev_b","ps_g","ps_b","pb_g","pb_b
 
 # Sectors where R&D intensity is a genuinely meaningful signal
 RND_SECTORS = ("Technology", "Healthcare", "Communication Services", "Industrials")
+
+VERSION = "5.3.1"
+
+# Sector concentration is meaningless on a handful of names: with 2 tickers in
+# 2 sectors each sector is 50%, which would trip any threshold below that.
+MIN_CONC_TICKERS = 4
 
 def srules(sector):
     return dict(zip(S_KEYS, SECTORS.get(sector, DEFAULT_S)))
@@ -208,7 +250,12 @@ def calc_metrics(d):
     # Valuation
     m["pe"] = info.get("trailingPE")
     m["fwd_pe"] = info.get("forwardPE")
-    m["peg"] = info.get("pegRatio")
+    # Yahoo dropped `pegRatio` from the standard quoteSummary modules; yfinance
+    # supplies `trailingPegRatio` through a separate timeseries call. Try the
+    # current key first, then the legacy one for older yfinance builds.
+    m["peg"] = num(info.get("trailingPegRatio"))
+    if m["peg"] is None:
+        m["peg"] = num(info.get("pegRatio"))
     m["ps"] = info.get("priceToSalesTrailing12Months")
     m["pb"] = info.get("priceToBook")
     m["ev_ebitda"] = info.get("enterpriseToEbitda")
@@ -232,11 +279,13 @@ def calc_metrics(d):
     tax_r = info.get("effectiveTaxRate")
     if tax_r is None or tax_r < 0 or tax_r > 0.6: tax_r = 0.21
     equity = rf(bal, ["Stockholders Equity", "Total Stockholders Equity", "Common Stock Equity"])
-    debt = rf(bal, ["Total Debt", "Long Term Debt"]) or 0
+    debt_raw = rf(bal, ["Total Debt", "Long Term Debt"])   # None = not reported
+    debt = debt_raw or 0
     cash = rf(bal, ["Cash And Cash Equivalents", "Cash", "Cash Cash Equivalents And Short Term Investments"]) or 0
     inv_cap = (equity or 0) + debt - cash
     m["roic"] = sd(ebit * (1 - tax_r), inv_cap) if ebit and inv_cap > 0 else None
     m["ebit"] = ebit
+    m["total_debt"] = debt_raw
 
     # Growth (raw values for display)
     rev0, rev1 = rv(fin, "Total Revenue", 0), rv(fin, "Total Revenue", 1)
@@ -300,10 +349,16 @@ def calc_metrics(d):
     m["quick_ratio"] = info.get("quickRatio")
     m["debt_eq"] = info.get("debtToEquity")
     if m["debt_eq"] is not None: m["debt_eq"] /= 100
+    if m["debt_eq"] is not None and m["debt_eq"] < 0:
+        m["warnings"].append("Negative book equity: P/B, D/E and ROE are not meaningful "
+                             "and are excluded from scoring.")
     int_exp = rv(fin, "Interest Expense")
     if int_exp and int_exp < 0: int_exp = abs(int_exp)
     m["int_coverage"] = sd(ebit, int_exp) if ebit and int_exp else None
-    m["fcf_quality"] = sd(fcf0, ni0) if fcf0 and ni0 else None
+    # FCF/NI only reads correctly with a positive denominator: a company that
+    # both loses money and burns cash divides two negatives into a healthy-
+    # looking ratio.
+    m["fcf_quality"] = sd(fcf0, ni0) if fcf0 and ni0 and ni0 > 0 else None
 
     # 52W: prefer info.fiftyTwoWeek*, fallback to history
     m["52w_high"] = info.get("fiftyTwoWeekHigh")
@@ -533,7 +588,16 @@ def dcf_scenarios(d, m):
 
 # ─── SCORING ───────────────────────────────────────────────────────────────
 def score(val, good, bad, higher=True):
+    """Map a metric onto a 1-10 scale.
+
+    Returns None when the value is not interpretable on this scale: a negative
+    ratio on a lower-is-better metric means its denominator (earnings, EBITDA,
+    book equity) has gone negative, which is not the same thing as being
+    cheap. Callers drop those inputs and renormalize the surviving weights.
+    A genuinely missing value still scores a neutral 5.0.
+    """
     if val is None: return 5.0
+    if not higher and val < 0: return None
     if higher:
         if val >= good: return 10.0
         if val <= bad:  return 1.0
@@ -542,6 +606,34 @@ def score(val, good, bad, higher=True):
         if val <= good: return 10.0
         if val >= bad:  return 1.0
         return 1 + 9 * (bad - val) / (bad - good)
+
+def interest_coverage_score(m):
+    """Interest coverage, capped at 30x for scoring (the displayed figure is
+    uncapped).
+
+    A company with no debt has no interest to cover. That is the strongest
+    possible position on this metric, not a missing data point, so it scores
+    10 rather than falling through to the neutral 5.0 used for absent data.
+    """
+    ic = m.get("int_coverage")
+    if ic is not None:
+        return score(min(ic, 30), 10.0, 1.50, True)
+    td, de = m.get("total_debt"), m.get("debt_eq")
+    if (td is not None and td <= 0) or (de is not None and de == 0):
+        return 10.0                       # genuinely debt-free
+    return score(None, 10.0, 1.50, True)  # carries debt, coverage unknown
+
+def fcf_quality_score(m):
+    """FCF / net income, scored only when net income is positive.
+
+    With a negative denominator the ratio inverts: cash burn over a net loss
+    reads as high quality. Excluded rather than imputed, so the rest of the
+    Health dimension renormalizes around it.
+    """
+    ni = m.get("net_income")
+    if ni is None or ni <= 0:
+        return None
+    return score(m.get("fcf_quality"), 1.2, 0.30, True)
 
 def build_scores(m, pio, alt, gra, mag, dc):
     rules = srules(m.get("sector"))
@@ -553,10 +645,12 @@ def build_scores(m, pio, alt, gra, mag, dc):
     ps_s  = score(m.get("ps"),        rules["ps_g"],  rules["ps_b"], False)
     pb_s  = score(m.get("pb"),        rules["pb_g"],  rules["pb_b"], False)
     if m.get("peg_excluded") or m.get("peg") is None:
-        val_s = pe_s*0.25 + fpe_s*0.20 + ev_s*0.25 + ps_s*0.15 + pb_s*0.15
+        val_s = wavg([(pe_s, 0.25), (fpe_s, 0.20), (ev_s, 0.25),
+                      (ps_s, 0.15), (pb_s, 0.15)])
     else:
         peg_s = score(m.get("peg"), rules["peg_g"], rules["peg_b"], False)
-        val_s = pe_s*0.22 + fpe_s*0.18 + ev_s*0.22 + ps_s*0.13 + pb_s*0.15 + peg_s*0.10
+        val_s = wavg([(pe_s, 0.22), (fpe_s, 0.18), (ev_s, 0.22),
+                      (ps_s, 0.13), (pb_s, 0.15), (peg_s, 0.10)])
 
     # Profitability
     gm_s   = score(m.get("gross_margin"), 0.45, 0.10, True)
@@ -564,26 +658,25 @@ def build_scores(m, pio, alt, gra, mag, dc):
     roe_s  = score(m.get("roe"),  rules["roe_g"],  0.00, True)
     roa_s  = score(m.get("roa"),  0.08, 0.00, True)
     roic_s = score(m.get("roic"), rules["roic_g"], 0.00, True)
-    prof_s = (gm_s + om_s + roe_s + roa_s + roic_s) / 5
+    prof_s = dim([gm_s, om_s, roe_s, roa_s, roic_s])
 
     # Growth
     cap = rules["gcap"]
     rg_s = score(m.get("rev_growth"), cap, -0.05, True)
     eg_s = score(m.get("eps_growth"), cap, -0.10, True)
     fg_s = score(m.get("fcf_growth"), cap, -0.10, True)
-    grow_s = (rg_s + eg_s + fg_s) / 3
+    grow_s = dim([rg_s, eg_s, fg_s])
 
     # Health (cap interest coverage at 30x for scoring purposes only)
     de_s = score(m.get("debt_eq"),    0.30, 2.50, False)
     cr_s = score(m.get("curr_ratio"), 2.50, 1.00, True)
     qr_s = score(m.get("quick_ratio"),1.50, 0.50, True)
-    ic_capped = min(m["int_coverage"], 30) if m.get("int_coverage") else None
-    ic_s = score(ic_capped, 10.0, 1.50, True)
-    fq_s = score(m.get("fcf_quality"), 1.2, 0.30, True)
-    health_s = (de_s + cr_s + qr_s + ic_s + fq_s) / 5
+    ic_s = interest_coverage_score(m)
+    fq_s = fcf_quality_score(m)
+    health_s = dim([de_s, cr_s, qr_s, ic_s, fq_s])
 
     # Momentum
-    mom_s = score(m.get("pos_52w"), 0.80, 0.20, True)
+    mom_s = dim([score(m.get("pos_52w"), 0.80, 0.20, True)])
 
     # Frameworks
     fw = []
@@ -625,7 +718,12 @@ def position_guidance(m, sc, ins):
     flags = []
     if (m.get("beta") or 1.0) > 1.3: flags.append("high beta")
     if m.get("sector") in ("Basic Materials", "Energy"): flags.append("commodity/cyclical")
-    if m.get("debt_eq") and m["debt_eq"] > 1.0: flags.append("elevated leverage")
+    de = m.get("debt_eq")
+    if de is not None and de < 0:
+        # A negative ratio means equity is negative, not that leverage is low.
+        flags.append("negative book equity")
+    elif de is not None and de > 1.0:
+        flags.append("elevated leverage")
     if m.get("pos_52w") and m["pos_52w"] > 0.85: flags.append("near 52-week high")
     if m.get("peg_excluded"): flags.append("unreliable PEG")
     if sc["dims"].get("Valuation", 10) < 5.5: flags.append("valuation not cheap")
@@ -792,8 +890,9 @@ def print_report(ticker, m, sc, pio, alt, gra, mag, dc, ins, pos, vs):
     rule(); print()
 
 def print_diversification_summary(results):
-    """Portfolio-mode sector diversification summary (v5.3). Only shown when
-    2+ tickers were evaluated in a single batch run."""
+    """Portfolio-mode sector diversification summary (v5.3). Shown whenever 2+
+    tickers were evaluated in one batch; concentration is only judged once
+    there are at least MIN_CONC_TICKERS of them."""
     W = 62
 
     def rule(ch="═"): print("  " + ch * W)
@@ -822,15 +921,19 @@ def print_diversification_summary(results):
             print(f"    {it['ticker']:<8}  {colour(it['composite'])} / 10")
 
     print(); rule("─")
-    warned = False
-    for sector, items in ordered:
-        pct = len(items) / total * 100
+    if total < MIN_CONC_TICKERS:
+        print(f"  {Y}Only {total} candidates — too few to judge sector concentration."
+              f"  Evaluate at least {MIN_CONC_TICKERS}.{X}")
+    else:
+        # Only the largest sector is worth a warning; reporting every sector
+        # over the threshold flags both halves of an evenly split list.
+        top_sector, top_items = ordered[0]
+        pct = len(top_items) / total * 100
         if pct > 40:
             print(f"  {Y}Concentration risk: {pct:.0f}% of candidates are in "
-                  f"{sector}. Consider diversifying across sectors.{X}")
-            warned = True
-    if not warned:
-        print(f"  {G}Sector spread looks reasonably diversified.{X}")
+                  f"{top_sector}. Consider diversifying across sectors.{X}")
+        else:
+            print(f"  {G}Sector spread looks reasonably diversified.{X}")
     rule(); print()
 
 # ─── MAIN ──────────────────────────────────────────────────────────────────
@@ -852,9 +955,11 @@ def evaluate(ticker):
     return {"ticker": ticker, "sector": m["sector"], "composite": sc["composite"]}
 
 def main():
-    print(f"\n  {B}{C}╔═════════════════════════════════════╗{X}")
-    print(f"  {B}{C}║  Stock Evaluator v5.3 Risk-Adjusted ║{X}")
-    print(f"  {B}{C}╚═════════════════════════════════════╝{X}")
+    title = f"Stock Evaluator v{VERSION} Risk-Adjusted"
+    w = len(title) + 2          # always one space each side, whatever VERSION is
+    print(f"\n  {B}{C}╔{'═' * w}╗{X}")
+    print(f"  {B}{C}║{title.center(w)}║{X}")
+    print(f"  {B}{C}╚{'═' * w}╝{X}")
 
     # CLI mode: python stock_evaluator.py TICKER [TICKER ...]
     if len(sys.argv) > 1:
