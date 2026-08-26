@@ -3,6 +3,44 @@
 Stock Investment Evaluator v5.3.1 — Compact Risk-Adjusted Edition
 Yahoo Finance via yfinance. Optimized for iPhone a-Shell.
 
+v5.4 changes vs v5.3.1 (measurement accuracy):
+- Piotroski is now the published F-Score. Six of the nine tests compare a
+  ratio against its own prior year, so all inputs come from the annual
+  statements instead of mixing Yahoo's TTM ROA against a prior-year annual
+  one. The share-issuance (dilution) test is restored, "positive net income"
+  — which duplicated "ROA > 0" — is gone, and margin/turnover tests compare
+  ratios rather than absolute profit and revenue. Tests without data are
+  skipped, and the score is reported out of however many actually ran.
+- Altman Z is sector-aware. It is skipped for Financial Services and Real
+  Estate, which Altman never fitted; goods producers keep the original
+  manufacturing Z, and everything else uses Z" (1995), which drops the sales
+  term and uses book equity rather than market cap. Zone cutoffs and the
+  framework sub-score follow the variant.
+- The DCF is labelled and discounted as what it is. yfinance's Free Cash Flow
+  is struck after interest, so it is an equity cash flow: discounted at a
+  CAPM cost of equity (RISK_FREE + beta x EQUITY_RP, both exposed as
+  constants) and divided by shares with no net-debt bridge. The old
+  +/-2%-per-beta-point adjustment implied a 2% equity risk premium.
+- A DCF is no longer produced for FCF-negative companies; it reported
+  negative intrinsic values per share as if they were prices.
+- Magic Formula puts both legs on Greenblatt's pre-tax EBIT basis: earnings
+  yield against enterprise value, return on capital against net working
+  capital plus net fixed assets. It previously added a pre-tax yield to the
+  NOPAT-based ROIC. The 1/(EV/EBITDA) fallback is an EBITDA yield and is now
+  shown but excluded from scoring.
+- Debt and cash are resolved once, from one set of row names, so ROIC,
+  enterprise value and cash runway describe the same balance sheet. Total
+  debt falls back to long-term plus current borrowings rather than long-term
+  alone, which used to drop short-term debt silently.
+- ROIC falls back to asset-side invested capital when buybacks have driven
+  book equity negative. It previously returned None, which also made the
+  Magic Formula vanish from the report with no explanation.
+- EPS growth comes from annual diluted EPS, matching the basis of revenue and
+  FCF growth. Yahoo's `earningsGrowth` is a quarterly YoY figure and let one
+  quarter carry a third of the Growth dimension; the basis is now printed.
+- The stale-statement check survives timezone-aware columns instead of
+  raising into a bare except and silently disabling itself.
+
 v5.3.1 changes vs v5.3 (accuracy fixes):
 - score() no longer returns a perfect 10 for negative ratios. A negative
   P/E, EV/EBITDA, P/B or D/E means the denominator (earnings, EBITDA, book
@@ -182,7 +220,33 @@ S_KEYS = ["pe_g","pe_b","peg_g","peg_b","ev_g","ev_b","ps_g","ps_b","pb_g","pb_b
 # Sectors where R&D intensity is a genuinely meaningful signal
 RND_SECTORS = ("Technology", "Healthcare", "Communication Services", "Industrials")
 
-VERSION = "5.3.1"
+VERSION = "5.4"
+
+# Balance-sheet / cash-flow row names, resolved in one place so ROIC,
+# enterprise value, the Magic Formula and cash runway all describe the same
+# balance sheet instead of each picking a different row.
+OCF_ROWS   = ["Operating Cash Flow", "Total Cash From Operating Activities",
+              "Cash Flow From Continuing Operating Activities"]
+CASH_ROWS  = ["Cash Cash Equivalents And Short Term Investments",
+              "Cash And Cash Equivalents", "Cash"]
+LTD_ROWS   = ["Long Term Debt", "Long Term Debt And Capital Lease Obligation"]
+CURDEBT_ROWS = ["Current Debt", "Short Long Term Debt",
+                "Current Debt And Capital Lease Obligation", "Other Current Borrowings"]
+PPE_ROWS   = ["Net PPE", "Net Property Plant And Equipment",
+              "Property Plant And Equipment Net"]
+SHARES_ROWS = ["Ordinary Shares Number", "Share Issued",
+               "Common Stock Shares Outstanding"]
+
+# Cost-of-equity inputs for the DCF. Update as rates move — these are the two
+# numbers that move every intrinsic value in the model.
+RISK_FREE = 0.042      # ~10-year Treasury
+EQUITY_RP = 0.045      # long-run equity risk premium
+
+# Altman never fitted Z to lenders or landlords; their balance sheets break it.
+NO_ALTMAN_SECTORS = ("Financial Services", "Real Estate")
+# Goods producers get the original manufacturing Z; everything else gets Z".
+MANUFACTURING_SECTORS = ("Basic Materials", "Energy", "Industrials",
+                         "Consumer Cyclical", "Consumer Defensive")
 
 # Sector concentration is meaningless on a handful of names: with 2 tickers in
 # 2 sectors each sector is 50%, which would trip any threshold below that.
@@ -241,10 +305,13 @@ def calc_metrics(d):
     # Stale data check
     try:
         if fin is not None and not fin.empty and hasattr(fin.columns[0], "to_pydatetime"):
-            age = (datetime.now() - fin.columns[0].to_pydatetime()).days
+            col = fin.columns[0].to_pydatetime()
+            # yfinance returns tz-aware columns for some tickers; comparing one
+            # against a naive now() raises and would silently disable the check.
+            age = (datetime.now(col.tzinfo) - col).days
             if age > 425:
                 m["warnings"].append(f"Most recent annual statements are {age} days old.")
-    except Exception:
+    except (TypeError, AttributeError, IndexError, ValueError):
         pass
 
     # Valuation
@@ -279,13 +346,32 @@ def calc_metrics(d):
     tax_r = info.get("effectiveTaxRate")
     if tax_r is None or tax_r < 0 or tax_r > 0.6: tax_r = 0.21
     equity = rf(bal, ["Stockholders Equity", "Total Stockholders Equity", "Common Stock Equity"])
-    debt_raw = rf(bal, ["Total Debt", "Long Term Debt"])   # None = not reported
-    debt = debt_raw or 0
-    cash = rf(bal, ["Cash And Cash Equivalents", "Cash", "Cash Cash Equivalents And Short Term Investments"]) or 0
+
+    # Total debt, preferring the reported total; otherwise long-term plus
+    # current borrowings, so short-term debt is not silently dropped.
+    debt_raw = rv(bal, "Total Debt", 0)
+    if debt_raw is None:
+        ltd, cur = rf(bal, LTD_ROWS), rf(bal, CURDEBT_ROWS)
+        debt_raw = (ltd or 0) + (cur or 0) if (ltd is not None or cur is not None) else None
+    # Cash including short-term investments — the enterprise-value convention.
+    cash_raw = rf(bal, CASH_ROWS)
+    m["total_debt"], m["cash_and_st"] = debt_raw, cash_raw
+    debt, cash = debt_raw or 0, cash_raw or 0
+
     inv_cap = (equity or 0) + debt - cash
+    if inv_cap <= 0:
+        # Buybacks can drive book equity negative, which makes the financing
+        # side of invested capital meaningless. Fall back to the asset side:
+        # total assets less non-interest-bearing current liabilities.
+        ta = rv(bal, "Total Assets", 0)
+        cl = rv(bal, "Current Liabilities", 0) or 0
+        cur_debt = rf(bal, CURDEBT_ROWS) or 0
+        if ta:
+            inv_cap = ta - max(0.0, cl - cur_debt)
+            m["notes"].append("ROIC uses asset-side invested capital (book equity is negative).")
     m["roic"] = sd(ebit * (1 - tax_r), inv_cap) if ebit and inv_cap > 0 else None
     m["ebit"] = ebit
-    m["total_debt"] = debt_raw
+    m["invested_capital"] = inv_cap if inv_cap > 0 else None
 
     # Growth (raw values for display)
     rev0, rev1 = rv(fin, "Total Revenue", 0), rv(fin, "Total Revenue", 1)
@@ -294,7 +380,20 @@ def calc_metrics(d):
     ni0, ni1 = rv(fin, "Net Income", 0), rv(fin, "Net Income", 1)
     m["ni_growth"] = sd(ni0 - ni1, abs(ni1)) if ni0 and ni1 else None
     m["eps"] = info.get("trailingEps")
-    m["eps_growth_raw"] = info.get("earningsGrowth")
+
+    # Yahoo's `earningsGrowth` is the latest *quarterly* YoY figure. Averaging
+    # it with annual revenue and FCF growth lets one quarter carry a third of
+    # the Growth dimension, so prefer annual EPS off the income statement.
+    eps0, eps1 = rf(fin, ["Diluted EPS", "Basic EPS"], 0), rf(fin, ["Diluted EPS", "Basic EPS"], 1)
+    if eps0 is not None and eps1:
+        m["eps_growth_raw"] = (eps0 - eps1) / abs(eps1)
+        m["eps_growth_basis"] = "annual diluted EPS"
+    elif m["ni_growth"] is not None:
+        m["eps_growth_raw"] = m["ni_growth"]
+        m["eps_growth_basis"] = "annual net income (EPS not reported)"
+    else:
+        m["eps_growth_raw"] = num(info.get("earningsGrowth"))
+        m["eps_growth_basis"] = "quarterly YoY (no annual EPS available)"
 
     # ─── R&D intensity (v5) ────────────────────────────────────────────────
     rnd = rf(fin, ["Research And Development", "Research Development"])
@@ -322,10 +421,8 @@ def calc_metrics(d):
     m["fcf_growth"] = clamp(m["fcf_growth_raw"], -0.30, cap) if cyc else m["fcf_growth_raw"]
 
     # ─── Cash runway (v5) — only meaningful for cash-burning firms ──────────
-    ocf = rf(cf, ["Operating Cash Flow", "Total Cash From Operating Activities",
-                  "Cash Flow From Continuing Operating Activities"])
-    cash_pos = rf(bal, ["Cash Cash Equivalents And Short Term Investments",
-                        "Cash And Cash Equivalents", "Cash"])
+    ocf = rf(cf, OCF_ROWS)
+    cash_pos = m["cash_and_st"]
     m["operating_cf"] = ocf
     m["cash_position"] = cash_pos
     burns = []
@@ -401,54 +498,103 @@ def value_screen(m, dims):
 
 # ─── FRAMEWORKS ────────────────────────────────────────────────────────────
 def piotroski(d):
-    info, fin, bal, cf = d["info"], d["fin"], d["bal"], d["cf"]
-    score, sigs = 0, {}
+    """Piotroski F-Score, as published: nine binary tests across profitability,
+    leverage/liquidity and operating efficiency.
+
+    Six of the nine compare a ratio against its own prior year, so all inputs
+    come from the annual statements. (Mixing Yahoo's TTM `returnOnAssets`
+    against a prior-year annual ROA compares two different bases.) A test whose
+    inputs are missing is skipped rather than counted as a failure, so the
+    score is reported out of however many actually ran.
+    """
+    fin, bal, cf = d["fin"], d["bal"], d["cf"]
+    sigs = {}
     def add(label, cond):
-        nonlocal score
-        sigs[label] = 1 if bool(cond) else 0
-        score += sigs[label]
+        sigs[label] = None if cond is None else (1 if cond else 0)
 
-    roa0 = info.get("returnOnAssets")
-    roa1 = sd(rv(fin, "Net Income", 1), rv(bal, "Total Assets", 1))
-    fcf = rv(cf, "Free Cash Flow", 0)
-    cfo = rf(cf, ["Operating Cash Flow", "Total Cash From Operating Activities", "Cash Flow From Continuing Operating Activities"])
-    ni0 = rv(fin, "Net Income", 0)
-    rev0, rev1 = rv(fin, "Total Revenue", 0), rv(fin, "Total Revenue", 1)
-    gp0, gp1 = rv(fin, "Gross Profit", 0), rv(fin, "Gross Profit", 1)
-    td0, td1 = rv(bal, "Total Debt", 0), rv(bal, "Total Debt", 1)
-    cr0 = info.get("currentRatio")
+    def ratio(a, b):
+        return None if a is None or not b else a / b
 
-    add("ROA > 0", roa0 and roa0 > 0)
-    add("FCF > 0", fcf and fcf > 0)
-    add("ROA improving", roa0 and roa1 and roa0 > roa1)
-    add("CFO > Net Income", cfo and ni0 and cfo > ni0)
-    add("Debt decreasing", td0 is not None and td1 is not None and td0 < td1)
-    add("Current ratio > 1", cr0 and cr0 > 1)
-    add("Positive net income", ni0 and ni0 > 0)
-    add("Revenue growing", rev0 and rev1 and rev0 > rev1)
-    add("Gross profit growing", gp0 and gp1 and gp0 > gp1)
+    ni0,  ni1  = rv(fin, "Net Income", 0),     rv(fin, "Net Income", 1)
+    ta0,  ta1  = rv(bal, "Total Assets", 0),   rv(bal, "Total Assets", 1)
+    rev0, rev1 = rv(fin, "Total Revenue", 0),  rv(fin, "Total Revenue", 1)
+    gp0,  gp1  = rv(fin, "Gross Profit", 0),   rv(fin, "Gross Profit", 1)
+    ca0,  ca1  = rv(bal, "Current Assets", 0), rv(bal, "Current Assets", 1)
+    cl0,  cl1  = rv(bal, "Current Liabilities", 0), rv(bal, "Current Liabilities", 1)
+    cfo0       = rf(cf, OCF_ROWS, 0)
+    ltd0, ltd1 = rf(bal, LTD_ROWS, 0), rf(bal, LTD_ROWS, 1)
+    if ltd0 is None and ltd1 is None:           # fall back to total debt
+        ltd0, ltd1 = rv(bal, "Total Debt", 0), rv(bal, "Total Debt", 1)
+    sh0,  sh1  = rf(bal, SHARES_ROWS, 0), rf(bal, SHARES_ROWS, 1)
 
-    label = "Strong" if score >= 7 else "Neutral" if score >= 4 else "Weak"
-    return {"score": score, "max": 9, "label": label, "signals": sigs}
+    roa0, roa1 = ratio(ni0, ta0), ratio(ni1, ta1)
+    cr0,  cr1  = ratio(ca0, cl0), ratio(ca1, cl1)
+    lev0, lev1 = ratio(ltd0, ta0), ratio(ltd1, ta1)
+    gm0,  gm1  = ratio(gp0, rev0), ratio(gp1, rev1)
+    at0,  at1  = ratio(rev0, ta0), ratio(rev1, ta1)
 
-def altman_z(d):
+    def gt(a, b): return None if a is None or b is None else a > b
+
+    # Profitability
+    add("ROA > 0",                  None if roa0 is None else roa0 > 0)
+    add("CFO > 0",                  None if cfo0 is None else cfo0 > 0)
+    add("ROA improving",            gt(roa0, roa1))
+    add("Accruals: CFO > NI",       gt(cfo0, ni0))
+    # Leverage, liquidity and source of funds
+    add("Leverage decreasing",      None if lev0 is None or lev1 is None else lev0 < lev1)
+    add("Current ratio improving",  gt(cr0, cr1))
+    add("No share dilution",        None if sh0 is None or sh1 is None else sh0 <= sh1 * 1.002)
+    # Operating efficiency
+    add("Gross margin improving",   gt(gm0, gm1))
+    add("Asset turnover improving", gt(at0, at1))
+
+    scored = [v for v in sigs.values() if v is not None]
+    total, mx = sum(scored), len(scored)
+    pct = total / mx if mx else None
+    label = ("N/A" if pct is None else
+             "Strong" if pct >= 7 / 9 else "Neutral" if pct >= 4 / 9 else "Weak")
+    return {"score": total, "max": mx, "label": label, "signals": sigs,
+            "skipped": [k for k, v in sigs.items() if v is None]}
+
+def altman_z(d, m=None):
+    """Altman Z, in the variant that fits the company.
+
+    The original 1968 Z was fitted on public *manufacturers* and Altman
+    explicitly excluded financial firms. Applying it universally reads a
+    healthy bank as distressed (banks carry huge liabilities by design) and an
+    asset-light cash burner as safe (few liabilities to divide into market
+    cap). Goods producers get the original Z; everything else gets Z" (1995),
+    which drops the sales term and uses book equity rather than market cap.
+    """
     info, fin, bal = d["info"], d["fin"], d["bal"]
+    sector = (m or {}).get("sector") or info.get("sector")
+    if sector in NO_ALTMAN_SECTORS:
+        return {"na": f"Altman Z is not defined for {sector}; skipped."}
+
     ta = rv(bal, "Total Assets", 0)
     if not ta: return None
-    ca = rv(bal, "Current Assets", 0) or 0
-    cl = rv(bal, "Current Liabilities", 0) or 0
-    re = rv(bal, "Retained Earnings", 0) or 0
+    ca  = rv(bal, "Current Assets", 0) or 0
+    cl  = rv(bal, "Current Liabilities", 0) or 0
+    re_ = rv(bal, "Retained Earnings", 0) or 0
     ebit = rf(fin, ["EBIT", "Operating Income"]) or 0
-    rev = rv(fin, "Total Revenue", 0) or 0
-    tl = rf(bal, ["Total Liabilities Net Minority Interest", "Total Liabilities"]) or 0
-    mc = info.get("marketCap") or 0
-    z = (1.2*sd(ca-cl, ta, 0) + 1.4*sd(re, ta, 0) + 3.3*sd(ebit, ta, 0) +
-         0.6*sd(mc, tl, 0) + sd(rev, ta, 0))
-    zone = "Safe" if z > 3.0 else "Grey" if z > 1.8 else "Distress"
+    tl  = rf(bal, ["Total Liabilities Net Minority Interest", "Total Liabilities"]) or 0
+
+    x1, x2, x3 = sd(ca - cl, ta, 0), sd(re_, ta, 0), sd(ebit, ta, 0)
+    if sector in MANUFACTURING_SECTORS:
+        mc = info.get("marketCap") or 0
+        z = 1.2*x1 + 1.4*x2 + 3.3*x3 + 0.6*sd(mc, tl, 0) + sd(rv(fin, "Total Revenue", 0) or 0, ta, 0)
+        variant, safe, distress = "Z (manufacturing)", 3.0, 1.8
+    else:
+        eq = rf(bal, ["Stockholders Equity", "Total Stockholders Equity", "Common Stock Equity"]) or 0
+        z = 6.56*x1 + 3.26*x2 + 6.72*x3 + 1.05*sd(eq, tl, 0)
+        variant, safe, distress = 'Z" (non-manufacturing)', 2.6, 1.1
+
+    zone = "Safe" if z > safe else "Grey" if z > distress else "Distress"
     warning = None
     if info.get("financialCurrency") and info.get("currency") and info.get("financialCurrency") != info.get("currency"):
         warning = "Z-score may need FX adjustment due to currency mismatch."
-    return {"score": round(z, 2), "zone": zone, "warning": warning}
+    return {"score": round(z, 2), "zone": zone, "variant": variant,
+            "safe": safe, "distress": distress, "warning": warning}
 
 def graham_number(m):
     eps, bvps, px = m.get("eps"), m.get("book_value"), m.get("price")
@@ -458,30 +604,48 @@ def graham_number(m):
     return {"graham": round(gn, 2), "price": px, "mos": round(mos*100, 1) if mos is not None else None}
 
 def magic_formula(d, m):
-    """Magic Formula: EBIT/EV. EBIT normalized for cyclicals (min of latest vs 3y avg)."""
+    """Greenblatt's Magic Formula: earnings yield and return on capital.
+
+    Both legs are pre-tax and EBIT-based, as published — pairing a pre-tax
+    yield with the NOPAT-based ROIC shown elsewhere in the report would add two
+    numbers computed on different bases. Return on capital uses net working
+    capital plus net fixed assets, not equity + debt - cash.
+
+    Greenblatt ranks a universe on these two; the absolute figures here are a
+    stand-in for that rank, which is why the report says so.
+    """
     info, fin, bal = d["info"], d["fin"], d["bal"]
     rules = srules(m.get("sector"))
 
-    # EBIT normalization for cyclicals
-    if rules["cyc"]:
+    if rules["cyc"]:   # normalize EBIT over the cycle
         ebit_vals = [rf(fin, ["EBIT", "Operating Income"], i) for i in range(3)]
-        ebit_avg = avg(ebit_vals)
-        ebit_latest = ebit_vals[0] if ebit_vals else None
+        ebit_avg, ebit_latest = avg(ebit_vals), ebit_vals[0] if ebit_vals else None
         ebit = min(ebit_latest, ebit_avg) if ebit_latest and ebit_avg else (ebit_latest or ebit_avg)
     else:
         ebit = m.get("ebit") or rf(fin, ["EBIT", "Operating Income"])
 
     market_cap = info.get("marketCap")
-    debt = rf(bal, ["Total Debt", "Long Term Debt"]) or 0
-    cash = rf(bal, ["Cash And Cash Equivalents", "Cash", "Cash Cash Equivalents And Short Term Investments"]) or 0
-    roic = m.get("roic")
+    debt, cash = m.get("total_debt") or 0, m.get("cash_and_st") or 0
 
-    if not ebit or not market_cap or not roic:
+    # Return on capital: EBIT / (net working capital + net fixed assets)
+    roc = None
+    ca, cl = rv(bal, "Current Assets", 0), rv(bal, "Current Liabilities", 0)
+    ppe = rf(bal, PPE_ROWS)
+    if ebit and ca is not None and cl is not None and ppe is not None:
+        cur_debt = rf(bal, CURDEBT_ROWS) or 0
+        nwc = max(0.0, (ca - cash) - (cl - cur_debt))
+        cap = nwc + ppe
+        roc = sd(ebit, cap) if cap > 0 else None
+
+    if not ebit or not market_cap:
         ev_eb = m.get("ev_ebitda")
-        if ev_eb and ev_eb > 0 and roic:
-            return {"ey": round((1/ev_eb)*100, 2), "roic": round(roic*100, 2),
-                    "combined": round(((1/ev_eb)+roic)*100, 2),
-                    "warning": "EY approximated from 1/EV-EBITDA."}
+        if ev_eb and ev_eb > 0:
+            # 1/(EV/EBITDA) is an EBITDA yield, structurally higher than the
+            # EBIT yield it stands in for — shown, but kept out of scoring.
+            return {"ey": round((1 / ev_eb) * 100, 2),
+                    "roc": round(roc * 100, 2) if roc is not None else None,
+                    "combined": None, "approx": True,
+                    "warning": "EY approximated from 1/EV-EBITDA (EBITDA basis); excluded from scoring."}
         return None
 
     ev = market_cap + debt - cash
@@ -490,8 +654,12 @@ def magic_formula(d, m):
     warning = None
     if info.get("financialCurrency") and info.get("currency") and info.get("financialCurrency") != info.get("currency"):
         warning = "Magic Formula may need FX adjustment."
-    return {"ey": round(ey*100, 2), "roic": round(roic*100, 2),
-            "combined": round((ey+roic)*100, 2), "warning": warning}
+    if roc is None:
+        warning = (warning + " " if warning else "") + "Return on capital not computable (working capital or PPE missing)."
+    return {"ey": round(ey * 100, 2),
+            "roc": round(roc * 100, 2) if roc is not None else None,
+            "combined": round((ey + roc) * 100, 2) if roc is not None else None,
+            "approx": False, "warning": warning}
 
 def insider_conviction(d):
     """
@@ -550,40 +718,55 @@ def insider_conviction(d):
         return None
 
 def dcf_scenarios(d, m):
-    """Bear/base/bull DCF with normalized FCF and beta-adjusted WACC."""
+    """Bear/base/bull equity DCF.
+
+    The projected figure is yfinance's Free Cash Flow (operating cash flow less
+    capex), which is struck *after* cash interest — a levered, equity-holder
+    cash flow. So it is discounted at the cost of equity and divided by shares
+    with no net-debt bridge; calling that rate a WACC (and then not subtracting
+    debt) would double-count the capital structure.
+
+    Cost of equity is CAPM: RISK_FREE + beta x EQUITY_RP. The previous
+    +/-2% per beta point implied a 2% equity risk premium, about half the
+    conventional figure, which compressed the spread between safe and
+    speculative names.
+    """
     fcf0 = m.get("fcf_normalized") or m.get("fcf_latest")
-    shares = m.get("shares")
-    price = m.get("price")
+    shares, price = m.get("shares"), m.get("price")
     if not fcf0 or not shares: return None
+    if fcf0 <= 0:
+        # Compounding a negative cash flow forward and discounting it is
+        # arithmetic, not valuation.
+        return {"na": "Company is FCF-negative; a DCF on negative cash flow is not meaningful."}
 
-    rules = srules(m.get("sector"))
-    cyc = rules["cyc"]
-    beta = m.get("beta") or 1.0
-    wacc_adj = (beta - 1) * 0.02  # +/- 2% per beta point from 1.0
+    cyc = srules(m.get("sector"))["cyc"]
+    beta = clamp(m.get("beta") or 1.0, 0.3, 3.0)
+    ke = RISK_FREE + beta * EQUITY_RP
 
+    # (name, growth, terminal growth, scenario risk premium, FCF adjustment)
     if cyc:
-        scenarios = [("bear", 0.03, 0.015, 0.105, 0.75),
-                     ("base", 0.06, 0.025, 0.095, 0.90),
-                     ("bull", 0.10, 0.030, 0.090, 1.00)]
+        scenarios = [("bear", 0.03, 0.015, 0.010, 0.75),
+                     ("base", 0.06, 0.025, 0.000, 0.90),
+                     ("bull", 0.10, 0.030, -0.005, 1.00)]
     else:
-        scenarios = [("bear", 0.04, 0.020, 0.105, 0.85),
-                     ("base", 0.08, 0.025, 0.095, 1.00),
-                     ("bull", 0.13, 0.030, 0.090, 1.10)]
+        scenarios = [("bear", 0.04, 0.020, 0.010, 0.85),
+                     ("base", 0.08, 0.025, 0.000, 1.00),
+                     ("bull", 0.13, 0.030, -0.005, 1.10)]
 
-    results = {}
-    for name, g, tg, dr, fcf_adj in scenarios:
-        dr += wacc_adj
+    results = {"cost_of_equity": round(ke * 100, 1), "beta_used": round(beta, 2)}
+    for name, g, tg, prem, fcf_adj in scenarios:
+        dr = ke + prem
         if dr <= tg: continue
         adj_fcf = fcf0 * fcf_adj
-        fwd = [adj_fcf * (1+g)**yr for yr in range(1, 6)]
-        tv = fwd[-1] * (1+tg) / (dr-tg)
-        pv = sum(f/(1+dr)**i for i, f in enumerate(fwd, 1)) + tv/(1+dr)**5
+        fwd = [adj_fcf * (1 + g) ** yr for yr in range(1, 6)]
+        tv = fwd[-1] * (1 + tg) / (dr - tg)
+        pv = sum(f / (1 + dr) ** i for i, f in enumerate(fwd, 1)) + tv / (1 + dr) ** 5
         iv = sd(pv, shares)
         upside = sd((iv or 0) - price, price) if price else None
         results[name] = {"iv": round(iv, 2) if iv else None,
-                         "upside": round(upside*100, 1) if upside is not None else None,
-                         "growth": round(g*100, 1), "terminal_growth": round(tg*100, 1),
-                         "discount_rate": round(dr*100, 1), "fcf_adjustment": fcf_adj}
+                         "upside": round(upside * 100, 1) if upside is not None else None,
+                         "growth": round(g * 100, 1), "terminal_growth": round(tg * 100, 1),
+                         "discount_rate": round(dr * 100, 1), "fcf_adjustment": fcf_adj}
     return results
 
 # ─── SCORING ───────────────────────────────────────────────────────────────
@@ -680,11 +863,21 @@ def build_scores(m, pio, alt, gra, mag, dc):
 
     # Frameworks
     fw = []
-    if pio: fw.append((pio["score"]/9) * 10)
-    if alt: fw.append(score(alt["score"], 3.0, 1.8, True))
+    if pio and pio.get("max"):
+        fw.append((pio["score"] / pio["max"]) * 10)   # out of however many tests ran
+    if alt and alt.get("score") is not None:
+        fw.append(score(alt["score"], alt["safe"], alt["distress"], True))
     if gra and gra["mos"] is not None: fw.append(score(gra["mos"], 40, -30, True))
-    if mag: fw.append(score(mag["combined"], 25, 5, True))
-    if dc and dc.get("base") and dc["base"].get("upside") is not None:
+    if mag and not mag.get("approx") and mag.get("ey") is not None:
+        # Greenblatt sums two *ranks*, not two raw percentages. Earnings yield
+        # runs 2-10% while return on capital on tangible capital routinely
+        # exceeds 100% for asset-light firms, so adding them lets the second
+        # swamp the first. Score each leg on its own scale and average.
+        legs = [score(mag["ey"], 8.0, 2.0, True)]
+        if mag.get("roc") is not None:
+            legs.append(score(mag["roc"], 40.0, 8.0, True))
+        fw.append(dim(legs))
+    if dc and not dc.get("na") and dc.get("base") and dc["base"].get("upside") is not None:
         fw.append(score(dc["base"]["upside"], 35, -20, True))
     fw_s = sum(fw)/len(fw) if fw else 5.0
 
@@ -713,7 +906,7 @@ def rate(comp, dims):
     if comp >= 4.0: return "SPECULATIVE / WEAK"
     return "AVOID"
 
-def position_guidance(m, sc, ins):
+def position_guidance(m, sc, ins, pio=None):
     comp = sc["composite"]
     flags = []
     if (m.get("beta") or 1.0) > 1.3: flags.append("high beta")
@@ -726,6 +919,8 @@ def position_guidance(m, sc, ins):
         flags.append("elevated leverage")
     if m.get("pos_52w") and m["pos_52w"] > 0.85: flags.append("near 52-week high")
     if m.get("peg_excluded"): flags.append("unreliable PEG")
+    if pio and pio.get("max") and pio["max"] < 7:
+        flags.append(f"thin Piotroski coverage ({pio['max']}/9 tests)")
     if sc["dims"].get("Valuation", 10) < 5.5: flags.append("valuation not cheap")
     if m.get("runway_months") is not None and m["runway_months"] < 12:
         flags.append("short cash runway")
@@ -781,26 +976,40 @@ def print_report(ticker, m, sc, pio, alt, gra, mag, dc, ins, pos, vs):
 
     print(); rule("─"); h("NAMED FRAMEWORKS"); rule("─")
     if pio:
-        sigs_yes = [k for k, v in pio["signals"].items() if v]
-        sigs_no  = [k for k, v in pio["signals"].items() if not v]
-        print(f"  Piotroski   {pio['score']}/9 — {pio['label']}")
+        sigs_yes = [k for k, v in pio["signals"].items() if v == 1]
+        sigs_no  = [k for k, v in pio["signals"].items() if v == 0]
+        sigs_na  = pio.get("skipped", [])
+        suffix = "" if pio["max"] == 9 else f"  ({9 - pio['max']} test(s) lacked data)"
+        print(f"  Piotroski   {pio['score']}/{pio['max']} — {pio['label']}{suffix}")
         if sigs_yes: print(f"    {G}✓{X}  {' | '.join(sigs_yes)}")
         if sigs_no:  print(f"    {R}✗{X}  {' | '.join(sigs_no)}")
-    if alt:
+        if sigs_na:  print(f"    {Y}–{X}  {' | '.join(sigs_na)}  (no data)")
+    if alt and alt.get("na"):
+        print(f"  Altman Z    {Y}{alt['na']}{X}")
+    elif alt:
         zc = G if alt["zone"] == "Safe" else (Y if alt["zone"] == "Grey" else R)
-        print(f"  Altman Z    {alt['score']}  [{zc}{alt['zone']}{X}]")
+        print(f"  Altman Z    {alt['score']}  [{zc}{alt['zone']}{X}]  ·  {alt['variant']}")
     if gra:
         arrow = "↑" if (gra["mos"] or 0) > 0 else "↓"
         print(f"  Graham      ${gra['graham']}  {arrow}  {gra['mos']}% MoS  (px ${gra['price']})")
     if mag:
-        print(f"  Magic Formula  EY {mag['ey']}%  ·  ROIC {mag['roic']}%  ·  Combined {mag['combined']}%")
-    if dc:
-        print("  DCF Scenarios:")
+        roc = f"{mag['roc']}%" if mag.get("roc") is not None else "N/A"
+        comb = f"{mag['combined']}%" if mag.get("combined") is not None else "N/A"
+        print(f"  Magic Formula  EY {mag['ey']}%  ·  Return on capital {roc}  ·  Combined {comb}")
+        print(f"  {Y}Both legs pre-tax (EBIT). Greenblatt ranks a universe on these;{X}")
+        print(f"  {Y}absolute levels here stand in for that rank.{X}")
+    if dc and dc.get("na"):
+        print(f"  DCF         {Y}{dc['na']}{X}")
+    elif dc:
+        print(f"  DCF Scenarios  (equity DCF · Ke {dc['cost_of_equity']}% at beta {dc['beta_used']}):")
         for name in ("bear", "base", "bull"):
-            s = dc.get(name)
-            if s:
-                sign = "+" if (s.get("upside") or 0) > 0 else ""
-                print(f"    {name.capitalize():<5} ${s['iv']:<8} ({sign}{s['upside']}%)  g={s['growth']}% WACC={s['discount_rate']}%")
+            sc_ = dc.get(name)
+            if sc_:
+                sign = "+" if (sc_.get("upside") or 0) > 0 else ""
+                print(f"    {name.capitalize():<5} ${sc_['iv']:<8} ({sign}{sc_['upside']}%)  "
+                      f"g={sc_['growth']}% Ke={sc_['discount_rate']}%")
+        print(f"  {Y}FCF is struck after interest, so it is discounted at the cost of{X}")
+        print(f"  {Y}equity and no net debt is subtracted.{X}")
 
     # ─── INSIDER ACTIVITY (v5) ─────────────────────────────────────────────
     print(); rule("─"); h("INSIDER ACTIVITY  (last 6 months)"); rule("─")
@@ -867,6 +1076,8 @@ def print_report(ticker, m, sc, pio, alt, gra, mag, dc, ins, pos, vs):
     print(f"  {B}— Growth (raw) —{X}")
     row("Revenue Growth",   m.get("rev_growth_raw"),".1%")
     row("EPS Growth",       m.get("eps_growth_raw"),".1%")
+    if m.get("eps_growth_basis"):
+        print(f"  {'  └ basis':<26}  {m['eps_growth_basis']}")
     row("FCF Growth",       m.get("fcf_growth_raw"),".1%")
     if m.get("fcf_normalized") != m.get("fcf_latest"):
         row("FCF (normalized)", m.get("fcf_normalized"), ",.0f")
@@ -943,13 +1154,13 @@ def evaluate(ticker):
     print(f"  {C}Calculating...{X}")
     m = calc_metrics(data)
     pio = piotroski(data)
-    alt = altman_z(data)
+    alt = altman_z(data, m)
     gra = graham_number(m)
     mag = magic_formula(data, m)
     ins = insider_conviction(data)
     dc  = dcf_scenarios(data, m)
     sc  = build_scores(m, pio, alt, gra, mag, dc)
-    pos = position_guidance(m, sc, ins)
+    pos = position_guidance(m, sc, ins, pio)
     vs  = value_screen(m, sc["dims"])
     print_report(ticker, m, sc, pio, alt, gra, mag, dc, ins, pos, vs)
     return {"ticker": ticker, "sector": m["sector"], "composite": sc["composite"]}
