@@ -2,3 +2,11 @@ __pycache__/
 *.pyc
 cache.json
 fonts/
+
+# cf.py (clip finder) inputs + generated outputs
+*.mp4
+*_transcript.txt
+*_transcript.json
+*_clip_candidates.json
+*_clip_report.json
+*_debug/
