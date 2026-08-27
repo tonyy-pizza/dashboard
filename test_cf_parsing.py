@@ -22,13 +22,23 @@ import cf
 
 
 CLIPS = [
-    {"start": 120.5, "end": 155.0, "category": "numbers",
+    {"start": 120.5, "end": 155.0, "category": "numbers", "strength": 9,
      "hook_line": "I lost four hundred grand in a weekend.",
      "why": "Big number, said flat, high replay value."},
-    {"start": 402.0, "end": 441.0, "category": "hot_take",
+    {"start": 402.0, "end": 441.0, "category": "hot_take", "strength": 8,
      "hook_line": "Ninety percent of this industry is a marketing funnel.",
      "why": "Debate bait, clean standalone quote."},
 ]
+
+# A synthetic chunk: one word every 0.5s from 0s to 600s, so word "wN" sits at
+# N*0.5 seconds. That makes an excerpt's contents assertable by index.
+def make_chunk(start=0.0, end=600.0, step=0.5):
+    n = int((end - start) / step)
+    return [{"word": f" w{i}", "start": round(start + i * step, 2),
+             "end": round(start + i * step + step * 0.8, 2)} for i in range(n)]
+
+
+CHUNK = make_chunk()
 
 
 class FakeResponse(dict):
@@ -65,14 +75,17 @@ class Args:
     temperature = 0.2
     think = False
     schema = False
+    per_chunk = cf.MAX_CANDIDATES_PER_CHUNK
+    min_strength = cf.MIN_STRENGTH
+    top = 0
 
 
-def score(raw, **respkw):
+def score(raw, chunk=None, args=None, **respkw):
     """Run one chunk through the real pipeline with a stubbed Ollama."""
     client = FakeClient(raw, **respkw)
     cf._client = client
     cf._think_supported = True
-    clips, diag = cf.find_moments("[0.0s] pretend transcript", 1, Args(), None)
+    clips, diag = cf.find_moments(chunk or CHUNK, 1, args or Args(), None)
     return clips, diag, client
 
 
@@ -144,7 +157,7 @@ class TestHostileModelOutput(unittest.TestCase):
 
         cf._client = OldClient(json.dumps(CLIPS))
         cf._think_supported = True
-        clips, diag = cf.find_moments("[0.0s] x", 1, Args(), None)
+        clips, diag = cf.find_moments(CHUNK, 1, Args(), None)
         self.assertEqual(len(clips), 2)
         self.assertTrue(any("too old for think=False" in n for n in diag["notes"]))
 
@@ -155,7 +168,7 @@ class TestHostileModelOutput(unittest.TestCase):
 
         cf._client = DeadClient("")
         cf._think_supported = True
-        clips, diag = cf.find_moments("[0.0s] x", 1, Args(), None)
+        clips, diag = cf.find_moments(CHUNK, 1, Args(), None)
         self.assertEqual(clips, [])
         self.assertEqual(diag["status"], "call_failed")
         self.assertTrue(any("connection refused" in n for n in diag["notes"]))
@@ -224,11 +237,15 @@ class TestHostileModelOutput(unittest.TestCase):
     # ── item-level coercion ─────────────────────────────────────────────
 
     def test_hhmmss_timestamps(self):
-        clips, _, _ = score(json.dumps([{
+        self.assertEqual(cf.to_seconds("02:00"), 120.0)
+        self.assertEqual(cf.to_seconds("01:02:30"), 3750.0)
+        clips, diag, _ = score(json.dumps([{
             "start": "02:00", "end": "01:02:30", "category": "numbers",
-            "hook_line": "x", "why": "y"}]))
+            "hook_line": "x", "why": "y", "strength": 8}]))
         self.assertEqual(clips[0]["start"], 120.0)
-        self.assertEqual(clips[0]["end"], 3750.0)
+        # 3750s parsed fine, then met the ceiling.
+        self.assertEqual(clips[0]["end"], 120.0 + cf.MAX_CLIP_SECONDS)
+        self.assertTrue(any("ceiling" in n for n in diag["notes"]))
 
     def test_bracketed_second_strings(self):
         clips, _, _ = score(json.dumps([{
@@ -239,8 +256,9 @@ class TestHostileModelOutput(unittest.TestCase):
 
     def test_missing_end_defaults_and_is_noted(self):
         clips, diag, _ = score(json.dumps([{
-            "start": 10, "category": "hot_take", "hook_line": "x", "why": "y"}]))
-        self.assertEqual(clips[0]["end"], 40.0)
+            "start": 10, "category": "hot_take", "hook_line": "x", "why": "y",
+            "strength": 8}]))
+        self.assertEqual(clips[0]["end"], 10 + cf.TARGET_CLIP_SECONDS[0])
         self.assertTrue(any("no usable end" in n for n in diag["notes"]))
 
     def test_alternate_field_names(self):
@@ -278,9 +296,188 @@ class TestHostileModelOutput(unittest.TestCase):
             num_ctx = 256
         cf._client = FakeClient(json.dumps(CLIPS))
         cf._think_supported = True
-        long_text = "[0.0s] " + ("word " * 2000)
-        _, diag = cf.find_moments(long_text, 1, Small(), None)
+        _, diag = cf.find_moments(CHUNK, 1, Small(), None)
         self.assertTrue(any("truncates the FRONT" in n for n in diag["notes"]))
+
+
+class TestClipWindows(unittest.TestCase):
+    """Problem 1: a window must carry setup and payoff, not just the line."""
+
+    def tearDown(self):
+        cf._client = None
+
+    def clip(self, start, end, strength=9):
+        return {"start": start, "end": end, "category": "numbers",
+                "hook_line": "x", "why": "y", "strength": strength}
+
+    def test_short_window_is_padded_to_the_floor(self):
+        clips, diag, _ = score(json.dumps([self.clip(100, 105)]))
+        self.assertGreaterEqual(clips[0]["duration"], cf.MIN_CLIP_SECONDS)
+        self.assertLess(clips[0]["start"], 100)     # gained lead-in
+        self.assertGreater(clips[0]["end"], 105)    # gained payoff
+        self.assertTrue(any("padded clip" in n for n in diag["notes"]))
+
+    def test_padding_favours_lead_in(self):
+        """start = where the setup begins, so the back gets the bigger share."""
+        clips, _, _ = score(json.dumps([self.clip(100, 105)]))
+        gained_back = 100 - clips[0]["start"]
+        gained_forward = clips[0]["end"] - 105
+        self.assertGreater(gained_back, gained_forward)
+
+    def test_padding_stops_at_the_chunk_start(self):
+        clips, _, _ = score(json.dumps([self.clip(0, 5)]))
+        self.assertEqual(clips[0]["start"], 0.0)
+        self.assertGreaterEqual(clips[0]["duration"], cf.MIN_CLIP_SECONDS)
+
+    def test_padding_stops_at_the_chunk_end(self):
+        chunk = make_chunk(0, 600)
+        end = chunk[-1]["end"]
+        clips, _, _ = score(json.dumps([self.clip(end - 5, end)]), chunk=chunk)
+        self.assertLessEqual(clips[0]["end"], end)
+        self.assertGreaterEqual(clips[0]["duration"], cf.MIN_CLIP_SECONDS)
+
+    def test_padding_never_reaches_into_a_neighbour(self):
+        clips, _, _ = score(json.dumps([self.clip(100, 105),
+                                        self.clip(130, 135, strength=8)]))
+        clips.sort(key=lambda c: c["start"])
+        self.assertEqual(len(clips), 2)
+        self.assertLessEqual(clips[0]["end"], clips[1]["start"])
+        for c in clips:
+            self.assertGreaterEqual(c["duration"], cf.MIN_CLIP_SECONDS)
+
+    def test_close_neighbours_still_both_reach_the_floor(self):
+        """Padding takes more lead-in when the forward side is blocked, so a
+        tight pair can still both clear the floor without colliding."""
+        clips, _, _ = score(json.dumps([self.clip(100, 103),
+                                        self.clip(108, 111, strength=8)]))
+        clips.sort(key=lambda c: c["start"])
+        self.assertLessEqual(clips[0]["end"], clips[1]["start"])
+        for c in clips:
+            self.assertGreaterEqual(c["duration"], cf.MIN_CLIP_SECONDS)
+
+    def test_window_pinned_by_the_chunk_reports_what_it_could_not_reach(self):
+        """A chunk shorter than the floor cannot produce a full window. The
+        clip is still returned - but it says so rather than lying."""
+        short = make_chunk(0, 12)
+        clips, diag, _ = score(json.dumps([self.clip(2, 5)]), chunk=short)
+        self.assertLess(clips[0]["duration"], cf.MIN_CLIP_SECONDS)
+        self.assertLessEqual(clips[0]["end"], short[-1]["end"])
+        self.assertEqual(clips[0]["start"], 0.0)
+        self.assertTrue(any("could only reach" in n for n in diag["notes"]))
+
+    def test_window_never_crosses_into_the_next_chunk(self):
+        chunk = make_chunk(600, 1200)
+        clips, _, _ = score(json.dumps([self.clip(1195, 1198)]), chunk=chunk)
+        self.assertLessEqual(clips[0]["end"], chunk[-1]["end"])
+        self.assertGreaterEqual(clips[0]["start"], chunk[0]["start"])
+
+    def test_overlong_window_is_trimmed_to_the_ceiling(self):
+        clips, diag, _ = score(json.dumps([self.clip(100, 400)]))
+        self.assertEqual(clips[0]["duration"], float(cf.MAX_CLIP_SECONDS))
+        self.assertEqual(clips[0]["start"], 100)   # lead-in kept, tail cut
+        self.assertTrue(any("trimmed" in n for n in diag["notes"]))
+
+    def test_windows_already_in_target_range_are_left_alone(self):
+        clips, _, _ = score(json.dumps([self.clip(100, 135)]))
+        self.assertEqual((clips[0]["start"], clips[0]["end"]), (100, 135))
+
+    def test_excerpt_comes_from_the_word_timings(self):
+        clips, _, _ = score(json.dumps([self.clip(120, 150)]))
+        excerpt = clips[0]["transcript_excerpt"]
+        # CHUNK puts word wN at N*0.5s, so [120, 150) is w240..w299.
+        self.assertTrue(excerpt.startswith("w240 w241"))
+        self.assertTrue(excerpt.endswith("w299"))
+        self.assertNotIn("w239", excerpt.split())
+        self.assertNotIn("w300", excerpt.split())
+
+    def test_excerpt_tracks_the_padded_window_not_the_original(self):
+        clips, _, _ = score(json.dumps([self.clip(100, 105)]))
+        words = clips[0]["transcript_excerpt"].split()
+        first = int(words[0][1:]) * 0.5
+        last = int(words[-1][1:]) * 0.5
+        self.assertLessEqual(first, clips[0]["start"] + 0.5)
+        self.assertGreaterEqual(last, clips[0]["end"] - 1.0)
+
+    def test_timestamp_outside_the_chunk_is_flagged(self):
+        clips, diag, _ = score(json.dumps([self.clip(5000, 5030)]))
+        self.assertEqual(clips[0]["transcript_excerpt"], "")
+        self.assertTrue(any("covers no transcript words" in n
+                            for n in diag["notes"]))
+
+    def test_excerpt_is_never_asked_of_the_model(self):
+        """It is reconstructed locally, so a hallucinated one is overwritten."""
+        item = self.clip(120, 150)
+        item["transcript_excerpt"] = "text the model made up"
+        clips, _, _ = score(json.dumps([item]))
+        self.assertNotIn("made up", clips[0]["transcript_excerpt"])
+        self.assertTrue(clips[0]["transcript_excerpt"].startswith("w240"))
+
+
+class TestSelectivity(unittest.TestCase):
+    """Problem 2: fewer, stronger candidates."""
+
+    def tearDown(self):
+        cf._client = None
+
+    def test_strength_is_carried_through(self):
+        clips, _, _ = score(json.dumps(CLIPS))
+        self.assertEqual([c["strength"] for c in clips], [9, 8])
+
+    def test_per_chunk_cap_keeps_the_strongest(self):
+        items = [{"start": 100 + i * 60, "end": 130 + i * 60, "strength": s,
+                  "category": "numbers", "hook_line": f"h{s}", "why": "y"}
+                 for i, s in enumerate([4, 9, 6, 8, 2])]
+        clips, diag, _ = score(json.dumps(items))
+        self.assertEqual(len(clips), cf.MAX_CANDIDATES_PER_CHUNK)
+        self.assertEqual(sorted((c["strength"] for c in clips), reverse=True),
+                         [9, 8, 6])
+        self.assertTrue(any("kept the 3 strongest" in n for n in diag["notes"]))
+
+    def test_missing_strength_defaults_and_says_so(self):
+        clips, diag, _ = score(json.dumps([{
+            "start": 100, "end": 130, "category": "numbers",
+            "hook_line": "x", "why": "y"}]))
+        self.assertEqual(clips[0]["strength"], cf.DEFAULT_STRENGTH)
+        self.assertTrue(any("no strength rating" in n for n in diag["notes"]))
+
+    def test_strength_as_fraction_string(self):
+        notes = []
+        self.assertEqual(cf.to_strength("8/10", notes), 8)
+
+    def test_strength_as_zero_to_one_confidence(self):
+        notes = []
+        self.assertEqual(cf.to_strength(0.9, notes), 9)
+        self.assertTrue(any("0-1 confidence" in n for n in notes))
+
+    def test_strength_out_of_range_is_clamped(self):
+        notes = []
+        self.assertEqual(cf.to_strength(47, notes), 10)
+        self.assertTrue(any("clamped" in n for n in notes))
+
+    def test_unreadable_strength_is_reported(self):
+        notes = []
+        self.assertIsNone(cf.to_strength("very high", notes))
+        self.assertTrue(any("unreadable strength" in n for n in notes))
+
+    def test_prompt_states_the_window_and_selection_rules(self):
+        prompt = cf.build_prompt("[0.0s] hello")
+        for expected in ("SETUP begins", "after the PAYOFF",
+                         f"{cf.TARGET_CLIP_SECONDS[0]}-{cf.TARGET_CLIP_SECONDS[1]} seconds",
+                         f"never shorter than\n  {cf.MIN_CLIP_SECONDS} seconds",
+                         f"never longer than {cf.MAX_CLIP_SECONDS}",
+                         "When in doubt, leave it out",
+                         f"at most {cf.MAX_CANDIDATES_PER_CHUNK}".lower()):
+            self.assertIn(expected.lower(), prompt.lower(), expected)
+
+    def test_criteria_names_concrete_exclusions(self):
+        for expected in ("REJECT", "routine business detail", "already hold",
+                         "administrative", "Generic advice"):
+            self.assertIn(expected, cf.CLIP_CRITERIA)
+
+    def test_schema_requires_strength_but_not_the_excerpt(self):
+        item = cf.CLIP_SCHEMA["properties"]["clips"]["items"]
+        self.assertIn("strength", item["required"])
+        self.assertNotIn("transcript_excerpt", item["properties"])
 
 
 class TestChunkingAndTranscript(unittest.TestCase):
@@ -307,6 +504,27 @@ class TestChunkingAndTranscript(unittest.TestCase):
             self.assertIsNone(cf.to_seconds(bad))
 
 
+class SequenceClient:
+    """Returns a different response per call, cycling if it runs out."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        raw = self._responses[min(len(self.calls) - 1, len(self._responses) - 1)]
+        return fake_resp(raw)
+
+
+def chunk_clips(offset, strengths):
+    """Clips sitting inside the chunk that starts at `offset`."""
+    return json.dumps({"clips": [
+        {"start": offset + 60 + i * 120, "end": offset + 95 + i * 120,
+         "category": "numbers", "hook_line": f"line {offset}-{s}",
+         "why": "y", "strength": s} for i, s in enumerate(strengths)]})
+
+
 class TestEndToEnd(unittest.TestCase):
     """Full main() over a cached transcript with Ollama stubbed out."""
 
@@ -329,21 +547,37 @@ class TestEndToEnd(unittest.TestCase):
         cf._client = None
         shutil.rmtree(self.dir, ignore_errors=True)
 
-    def test_full_run_writes_all_four_outputs(self):
-        cf._client = FakeClient("<think>scanning...</think>\n"
-                                + json.dumps({"clips": CLIPS}))
+    def test_full_run_writes_every_output(self):
+        cf._client = SequenceClient([
+            "<think>scanning...</think>\n" + chunk_clips(0, [9, 8]),
+            chunk_clips(600, [10]),
+            chunk_clips(1200, [7]),
+        ])
         cf._think_supported = True
         rc = cf.main([self.video, "--debug"])
         self.assertEqual(rc, 0)
 
         with open(self.base + "_clip_candidates.json", encoding="utf-8") as f:
             cands = json.load(f)
-        self.assertEqual(len(cands), 6)                    # 3 chunks x 2 clips
-        self.assertEqual(cands, sorted(cands, key=lambda c: c["start"]))
+        self.assertEqual(len(cands), 4)
+        # Strongest first, so a manual read-through starts with the best.
+        self.assertEqual([c["strength"] for c in cands], [10, 9, 8, 7])
+        for c in cands:
+            self.assertGreaterEqual(c["duration"], cf.MIN_CLIP_SECONDS)
+            self.assertLessEqual(c["duration"], cf.MAX_CLIP_SECONDS)
+            self.assertTrue(c["transcript_excerpt"],
+                            "every kept clip needs a readable excerpt")
+
+        with open(self.base + "_clip_candidates_all.json", encoding="utf-8") as f:
+            everything = json.load(f)
+        self.assertEqual(len(everything), 4)
 
         with open(self.base + "_clip_report.json", encoding="utf-8") as f:
             report = json.load(f)
-        self.assertEqual(report["total_candidates"], 6)
+        self.assertEqual(report["total_candidates"], 4)
+        self.assertEqual(report["scored_before_filter"], 4)
+        self.assertEqual(report["strength_histogram"],
+                         {"10": 1, "9": 1, "8": 1, "7": 1})
         self.assertEqual([c["status"] for c in report["chunks"]], ["ok"] * 3)
 
         with open(self.base + "_transcript.txt", encoding="utf-8") as f:
@@ -352,14 +586,16 @@ class TestEndToEnd(unittest.TestCase):
         self.assertIn("[00:29:40] segment 89 text", txt)
 
         # Raw dumps exist for every chunk, written before any parsing.
+        dumps = {}
         for i in (1, 2, 3):
             with open(os.path.join(self.base + "_debug", f"chunk_{i:02d}_raw.txt"),
                       encoding="utf-8") as f:
-                raw = f.read()
-            self.assertIn("<think>scanning...</think>", raw)
-            self.assertIn("response field (RAW, pre-parse)", raw)
+                dumps[i] = f.read()
+            self.assertIn("response field (RAW, pre-parse)", dumps[i])
             self.assertTrue(os.path.exists(os.path.join(
                 self.base + "_debug", f"chunk_{i:02d}_prompt.txt")))
+        # Chunk 1's reasoning is preserved verbatim, un-stripped, in the dump.
+        self.assertIn("<think>scanning...</think>", dumps[1])
 
     def test_debug_dump_happens_even_when_parsing_succeeds(self):
         cf._client = FakeClient(json.dumps(CLIPS))
@@ -388,6 +624,67 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(cf._client.calls, [])
         self.assertTrue(os.path.exists(self.base + "_transcript.txt"))
         self.assertFalse(os.path.exists(self.base + "_clip_candidates.json"))
+
+    def test_weak_candidates_are_filtered_out_but_still_recorded(self):
+        cf._client = SequenceClient([chunk_clips(0, [9, 5, 3]),
+                                     chunk_clips(600, [4]),
+                                     chunk_clips(1200, [8])])
+        cf._think_supported = True
+        cf.main([self.video])
+
+        with open(self.base + "_clip_candidates.json", encoding="utf-8") as f:
+            kept = json.load(f)
+        self.assertEqual([c["strength"] for c in kept], [9, 8])
+
+        # Nothing is lost - the bar can be retuned against this file.
+        with open(self.base + "_clip_candidates_all.json", encoding="utf-8") as f:
+            everything = json.load(f)
+        self.assertEqual([c["strength"] for c in everything], [9, 8, 5, 4, 3])
+
+        with open(self.base + "_clip_report.json", encoding="utf-8") as f:
+            report = json.load(f)
+        self.assertEqual(report["total_candidates"], 2)
+        self.assertEqual(report["scored_before_filter"], 5)
+        self.assertEqual(report["dropped_below_min_strength"], 3)
+        self.assertEqual(report["options"]["min_strength"], cf.MIN_STRENGTH)
+
+    def test_min_strength_is_tunable_from_the_command_line(self):
+        responses = [chunk_clips(0, [9, 5, 3]), chunk_clips(600, [4]),
+                     chunk_clips(1200, [8])]
+        cf._client = SequenceClient(responses)
+        cf._think_supported = True
+        cf.main([self.video, "--min-strength", "4"])
+        with open(self.base + "_clip_candidates.json", encoding="utf-8") as f:
+            self.assertEqual([c["strength"] for c in json.load(f)], [9, 8, 5, 4])
+
+    def test_top_caps_the_shortlist(self):
+        cf._client = SequenceClient([chunk_clips(0, [9, 8]),
+                                     chunk_clips(600, [10]),
+                                     chunk_clips(1200, [7])])
+        cf._think_supported = True
+        cf.main([self.video, "--top", "2"])
+        with open(self.base + "_clip_candidates.json", encoding="utf-8") as f:
+            self.assertEqual([c["strength"] for c in json.load(f)], [10, 9])
+        with open(self.base + "_clip_report.json", encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["dropped_by_top"], 2)
+
+    def test_per_chunk_cap_applies_across_the_whole_run(self):
+        cf._client = SequenceClient([chunk_clips(0, [9, 8, 7, 6, 10])])
+        cf._think_supported = True
+        cf.main([self.video, "--limit-chunks", "1"])
+        with open(self.base + "_clip_candidates.json", encoding="utf-8") as f:
+            self.assertEqual([c["strength"] for c in json.load(f)], [10, 9, 8])
+
+    def test_everything_filtered_out_is_reported_not_silent(self):
+        cf._client = FakeClient(chunk_clips(0, [2]))
+        cf._think_supported = True
+        cf.main([self.video, "--limit-chunks", "1"])
+        with open(self.base + "_clip_candidates.json", encoding="utf-8") as f:
+            self.assertEqual(json.load(f), [])
+        with open(self.base + "_clip_report.json", encoding="utf-8") as f:
+            report = json.load(f)
+        self.assertEqual(report["scored_before_filter"], 1)
+        self.assertEqual(report["dropped_below_min_strength"], 1)
 
     def test_missing_file_exits_nonzero(self):
         self.assertEqual(cf.main([os.path.join(self.dir, "nope.mp4")]), 1)

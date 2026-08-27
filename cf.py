@@ -15,15 +15,26 @@ Usage:
     py cf.py path\\to\\episode.mp4
     py cf.py path\\to\\episode.mp4 --debug          (dump raw model output)
     py cf.py path\\to\\episode.mp4 --limit-chunks 2 (score only 2 chunks)
+    py cf.py path\\to\\episode.mp4 --min-strength 8  (raise the bar)
     py cf.py path\\to\\episode.mp4 --transcript-only
 
 Outputs:
-    <episode>_clip_candidates.json - sorted list of candidate clips:
-        {"start": sec, "end": sec, "category": ..., "hook_line": ..., "why": ...}
-    <episode>_transcript.txt       - full readable transcript, [HH:MM:SS] per line
-    <episode>_transcript.json      - full transcript: segments + word timings
-    <episode>_clip_report.json     - per-chunk diagnostics (why a chunk was empty)
-    <episode>_debug/               - raw prompts + raw model responses (--debug)
+    <episode>_clip_candidates.json     - the shortlist, strongest first:
+        {"start": sec, "end": sec, "duration": sec, "strength": 1-10,
+         "category": ..., "hook_line": ..., "why": ...,
+         "transcript_excerpt": "<what is actually inside the window>"}
+    <episode>_clip_candidates_all.json - every scored candidate, before the
+        strength filter, so MIN_STRENGTH can be retuned without a re-run
+    <episode>_transcript.txt           - full readable transcript, [HH:MM:SS]
+    <episode>_transcript.json          - full transcript: segments + word timings
+    <episode>_clip_report.json         - per-chunk diagnostics (why a chunk was
+        empty) plus the strength histogram
+    <episode>_debug/                   - raw prompts + model responses (--debug)
+
+Windows are cut setup-to-payoff, not around the quotable line alone: the model
+is asked for a 25-50s span starting at the lead-in, and MIN/MAX_CLIP_SECONDS
+are then enforced in Python. Selectivity likewise - the prompt ranks and picks
+at most a few per chunk, and MIN_STRENGTH applies the bar in visible code.
 
 The transcript JSON doubles as a cache: later runs reuse it instead of
 re-transcribing, so you can iterate on the scoring step cheaply. Pass
@@ -56,9 +67,34 @@ CHUNK_SECONDS = 600              # ~10 min per model call, keeps prompts sane
 NUM_CTX = 8192
 NUM_PREDICT = 2048
 
-CLIP_CRITERIA = """
-You are screening a podcast transcript for short-form clip candidates for a
-trading/crypto founder-interview campaign. Flag moments that match ANY of:
+# Clip window shape. A clip has to open with enough setup that a viewer with
+# zero other context knows what is being discussed, and run past the quotable
+# line far enough to land the payoff or reaction. The model is asked for the
+# target range; MIN/MAX are enforced in Python afterwards, because an 8B model
+# will not hit a numeric duration instruction every single time.
+MIN_CLIP_SECONDS = 20            # hard floor - short windows get padded
+TARGET_CLIP_SECONDS = (25, 50)   # soft target range, stated in the prompt
+MAX_CLIP_SECONDS = 60            # hard ceiling - long windows get trimmed
+
+# Selectivity. The model ranks and picks; Python enforces the cap and the bar.
+MAX_CANDIDATES_PER_CHUNK = 3
+MIN_STRENGTH = 7                 # post-filter threshold on the 1-10 scale
+DEFAULT_STRENGTH = MIN_STRENGTH  # used when the model omits `strength`, so a
+                                 # formatting lapse never silently drops a clip
+
+CLIP_CRITERIA = f"""
+You are selecting short-form clip candidates from a podcast transcript for a
+trading/crypto founder-interview campaign.
+
+This is a RANKING task, not a filter. Do not flag everything that touches a
+category. Pick only the {MAX_CANDIDATES_PER_CHUNK} strongest moments in
+this section - fewer if fewer deserve it, and none at all is a perfectly
+good answer. When in doubt, leave it out.
+
+The bar: would a stranger scrolling past, with no idea who is talking or what
+the show is, stop and watch this to the end? If not, it does not qualify.
+
+Categories a moment must clearly land in:
 
 1. WILD TRADING STORIES - biggest wins, worst losses, moments that make
    someone rewind and replay.
@@ -66,9 +102,21 @@ trading/crypto founder-interview campaign. Flag moments that match ANY of:
 3. HOT TAKES - spicy opinions on crypto/trading/the industry, debate bait.
 4. FOUNDER STORY - how the company got built, behind-the-scenes, vision.
 
-Each candidate clip should run 15-60 seconds and needs a punchy, quotable
-line right at the start that could work as a 2-second hook.
-Skip anything bland, generic, or that doesn't clearly fit one category.
+REJECT these even though they nominally match a category:
+
+- A number said in passing as routine business detail - a fee, a date, a round
+  percentage, a headcount - with no stakes and no reaction to it. "THE NUMBERS"
+  means an amount big enough that saying it out loud is itself the moment.
+- An opinion most people in the industry already hold, or a hedged one
+  ("I think regulation is probably coming"). A HOT TAKE has to be one someone
+  would argue with in the replies.
+- Founder-story background that is administrative: incorporation, hiring
+  process, tooling choices, org structure, fundraising logistics. FOUNDER STORY
+  means a turning point with something at risk.
+- Generic advice that would fit any interview in any industry - work hard,
+  hire good people, stay focused, trust the process.
+- A good line with no story around it. A quotable sentence on its own is not a
+  clip; there has to be enough setup and follow-through to fill the window.
 """
 
 CATEGORIES = ["trading_story", "numbers", "hot_take", "founder_story"]
@@ -88,8 +136,10 @@ CLIP_SCHEMA = {
                     "category": {"type": "string", "enum": CATEGORIES},
                     "hook_line": {"type": "string"},
                     "why": {"type": "string"},
+                    "strength": {"type": "integer", "minimum": 1, "maximum": 10},
                 },
-                "required": ["start", "end", "category", "hook_line", "why"],
+                "required": ["start", "end", "category", "hook_line", "why",
+                             "strength"],
             },
         }
     },
@@ -271,6 +321,22 @@ def words_to_timestamped_text(words, words_per_line=15):
     if line:
         lines.append(f"[{line_start:.1f}s] " + "".join(line).strip())
     return "\n".join(lines)
+
+
+def words_to_excerpt(words, start, end, max_chars=1200):
+    """The actual transcript text spanning [start, end).
+
+    Built from the word timings we already have, never asked of the model -
+    so it is a faithful record of what is inside the window, usable to
+    sanity-check a candidate without opening the source audio.
+    """
+    picked = [w["word"] for w in words
+              if w["start"] >= start - 0.01 and w["start"] < end]
+    text = "".join(picked).strip()
+    text = " ".join(text.split())
+    if len(text) > max_chars:
+        text = text[:max_chars].rsplit(" ", 1)[0] + " [...]"
+    return text
 
 
 # ── RESPONSE PARSING ─────────────────────────────────────────────────────
@@ -498,6 +564,30 @@ def to_seconds(value):
         return None
 
 
+def to_strength(value, notes):
+    """Coerce the model's 1-10 self-rating. Accepts 8, "8", "8/10", and a
+    0-1 confidence, which some models return instead."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        text = value.strip().split("/")[0].strip()
+        try:
+            value = float(text)
+        except ValueError:
+            notes.append(f"unreadable strength {value!r}")
+            return None
+    if not isinstance(value, (int, float)):
+        return None
+    if 0 < value < 1:
+        notes.append(f"strength came back as a 0-1 confidence ({value}); "
+                     "scaled to the 1-10 scale")
+        value *= 10
+    scored = int(round(value))
+    if scored < 1 or scored > 10:
+        notes.append(f"strength {value} was outside 1-10; clamped")
+    return max(1, min(10, scored))
+
+
 def first_key(d, *names):
     for n in names:
         if n in d and d[n] not in (None, ""):
@@ -518,41 +608,146 @@ def coerce_clip(item, notes):
         notes.append(f"dropped an item with no usable start: {sorted(item)[:6]}")
         return None
     if end is None or end <= start:
-        end = start + 30.0
-        notes.append("item had no usable end; defaulted to start + 30s")
+        end = start + TARGET_CLIP_SECONDS[0]
+        notes.append(f"item had no usable end; defaulted to start + "
+                     f"{TARGET_CLIP_SECONDS[0]}s")
 
-    duration = end - start
-    if duration > 180:
-        notes.append(f"item ran {duration:.0f}s - kept, but it needs trimming")
+    strength = to_strength(first_key(item, "strength", "score", "rating",
+                                     "confidence"), notes)
+    if strength is None:
+        strength = DEFAULT_STRENGTH
+        notes.append(f"item had no strength rating; assumed {DEFAULT_STRENGTH} "
+                     "so a formatting lapse does not silently drop it")
 
     category = str(first_key(item, "category", "type", "tag") or "?").strip()
     return {
         "start": round(start, 2),
         "end": round(end, 2),
         "duration": round(end - start, 2),
+        "strength": strength,
         "category": category,
         "hook_line": str(first_key(item, "hook_line", "hook", "quote", "line") or "").strip(),
         "why": str(first_key(item, "why", "reason", "rationale") or "").strip(),
+        "transcript_excerpt": "",     # filled from the word timings, not the model
     }
+
+
+def cap_per_chunk(clips, notes, limit=MAX_CANDIDATES_PER_CHUNK):
+    """Keep only the strongest few. The prompt asks for this too, but asking
+    is not the same as getting it."""
+    if len(clips) <= limit:
+        return clips
+    ranked = sorted(clips, key=lambda c: (-c["strength"], c["start"]))
+    dropped = ranked[limit:]
+    notes.append(f"model returned {len(clips)} candidates for this chunk; kept "
+                 f"the {limit} strongest, dropped {len(dropped)} at strength "
+                 f"{sorted(d['strength'] for d in dropped)}")
+    return ranked[:limit]
+
+
+def enforce_windows(clips, chunk_start, chunk_end, notes):
+    """Make MIN/MAX_CLIP_SECONDS a guarantee rather than a prompt suggestion.
+
+    Short windows are padded outward - weighted toward lead-in, since the
+    setup is what makes a clip legible to someone with no other context.
+    Padding stops at the chunk's own bounds and at the midpoint between
+    neighbouring candidates, so a window never reaches into the next chunk
+    or swallows the clip beside it.
+    """
+    if not clips:
+        return clips
+
+    clips = sorted(clips, key=lambda c: c["start"])
+    for i, clip in enumerate(clips):
+        start, end = clip["start"], clip["end"]
+        before = end - start
+
+        low = chunk_start
+        if i > 0:
+            low = max(low, (clips[i - 1]["end"] + start) / 2.0)
+        high = chunk_end
+        if i < len(clips) - 1:
+            high = min(high, (end + clips[i + 1]["start"]) / 2.0)
+        # Bounds may already sit inside an overlapping window; never let them
+        # shrink a clip, only limit how far it grows.
+        low, high = min(low, start), max(high, end)
+
+        if end - start > MAX_CLIP_SECONDS:
+            end = start + MAX_CLIP_SECONDS
+            notes.append(f"clip at {start:.0f}s ran {before:.0f}s; trimmed to "
+                         f"the {MAX_CLIP_SECONDS}s ceiling (kept the lead-in)")
+
+        deficit = MIN_CLIP_SECONDS - (end - start)
+        if deficit > 0:
+            start = max(low, start - deficit * 0.6)
+            end = min(high, end + (MIN_CLIP_SECONDS - (end - start)))
+            if end - start < MIN_CLIP_SECONDS:        # forward padding capped
+                start = max(low, start - (MIN_CLIP_SECONDS - (end - start)))
+            got = end - start
+            if got + 0.05 < MIN_CLIP_SECONDS:
+                notes.append(f"clip at {start:.0f}s could only reach {got:.0f}s "
+                             f"against the {MIN_CLIP_SECONDS}s floor - it is up "
+                             "against the chunk edge or a neighbouring candidate")
+            else:
+                notes.append(f"padded clip at {start:.0f}s from {before:.0f}s "
+                             f"to {got:.0f}s to clear the {MIN_CLIP_SECONDS}s floor")
+
+        clip["start"] = round(start, 2)
+        clip["end"] = round(end, 2)
+        clip["duration"] = round(end - start, 2)
+    return clips
 
 
 # ── OLLAMA SCORING ───────────────────────────────────────────────────────
 
 def build_prompt(transcript_text):
+    lo, hi = TARGET_CLIP_SECONDS
     return f"""{CLIP_CRITERIA}
 
 Transcript (timestamps in seconds, [X.Xs] marks the start of each line):
 
 {transcript_text}
 
+HOW TO SET start AND end
+
+You are marking a whole moment, not a sentence. A clip that contains only the
+quotable line is unusable: a viewer with no other context cannot tell what is
+being discussed, and there is nothing to hold them past that one line.
+
+- "start" is where the SETUP begins - the question being answered, the moment
+  the story starts being told, the context that makes the line land. It is
+  almost never the timestamp of the quotable line itself; it is usually
+  several lines EARLIER than that.
+- "end" is after the PAYOFF - the reaction, the punchline, the number landing,
+  the thought reaching its natural close. Do not cut immediately after the
+  quotable sentence.
+- Target {lo}-{hi} seconds from start to end. Never shorter than
+  {MIN_CLIP_SECONDS} seconds, never longer than {MAX_CLIP_SECONDS}.
+- "hook_line" is the quotable line from inside that window, verbatim. It does
+  not have to sit at "start" - it is what the clip is built around.
+
+Read back your own start and end before answering: does someone who joined at
+"start" knowing nothing understand the moment by "end"? If not, widen it.
+
+OUTPUT
+
 Return ONLY a JSON object of the form {{"clips": [...]}}, no other text, no
-markdown fences. Each item in "clips":
-{{"start": <seconds, number>, "end": <seconds, number>,
+markdown fences. At most {MAX_CANDIDATES_PER_CHUNK} items, strongest first:
+{{"start": <seconds, number - where the setup begins>,
+  "end": <seconds, number - after the payoff>,
   "category": "trading_story|numbers|hot_take|founder_story",
   "hook_line": "<the most quotable line, verbatim from the transcript>",
-  "why": "<one sentence on why this clips well>"}}
+  "why": "<one sentence on why this clips well>",
+  "strength": <integer 1-10>}}
 
-If nothing in this chunk qualifies, return {{"clips": []}}.
+"strength" is how confident you are that THIS moment works as a standalone
+viral clip for someone with no other context - not how well it fits a
+category. Be honest and use the whole scale: 9-10 is a moment you would bet
+on, 7-8 is strong, 5-6 is filler that merely qualifies, 1-4 is weak. Most
+moments in an ordinary stretch of interview are not above 6.
+
+If nothing here clears that bar, return {{"clips": []}}. That is a normal and
+expected answer for most chunks.
 """
 
 
@@ -619,10 +814,12 @@ def dump_debug(debug_dir, index, prompt, resp, raw, notes):
         f.write("\n")
 
 
-def find_moments(transcript_text, index, args, debug_dir):
-    """Score one chunk. Returns (clips, diagnostics)."""
+def find_moments(chunk, index, args, debug_dir):
+    """Score one chunk of words. Returns (clips, diagnostics)."""
     notes = []
-    prompt = build_prompt(transcript_text)
+    chunk_start = chunk[0]["start"]
+    chunk_end = chunk[-1]["end"]
+    prompt = build_prompt(words_to_timestamped_text(chunk))
 
     tokens = est_tokens(prompt)
     if tokens > args.num_ctx * 0.85:
@@ -663,6 +860,17 @@ def find_moments(transcript_text, index, args, debug_dir):
         if clip:
             clips.append(clip)
 
+    # Selectivity and window shape are enforced here, not left to the prompt.
+    clips = cap_per_chunk(clips, notes, args.per_chunk)
+    clips = enforce_windows(clips, chunk_start, chunk_end, notes)
+    for clip in clips:
+        clip["transcript_excerpt"] = words_to_excerpt(chunk, clip["start"],
+                                                      clip["end"])
+        if not clip["transcript_excerpt"]:
+            notes.append(f"clip at {clip['start']:.0f}s covers no transcript "
+                         "words - the model invented a timestamp outside this "
+                         "chunk")
+
     status = "ok" if clips else ("empty" if data is not None else "parse_failed")
     diag = {
         "chunk": index,
@@ -676,6 +884,10 @@ def find_moments(transcript_text, index, args, debug_dir):
         "response_chars": len(raw),
         "thinking_chars": len(thinking),
         "raw_preview": raw[:300],
+        "chunk_start": round(chunk_start, 2),
+        "chunk_end": round(chunk_end, 2),
+        "strengths": sorted((c["strength"] for c in clips), reverse=True),
+        "durations": [c["duration"] for c in clips],
         "notes": notes,
     }
     return clips, diag
@@ -703,6 +915,17 @@ def parse_args(argv):
     p.add_argument("--schema", action="store_true",
                    help="constrain output with a JSON schema instead of plain "
                         "format=json (needs Ollama >= 0.5)")
+    p.add_argument("--min-strength", type=int, default=MIN_STRENGTH,
+                   help=f"keep only candidates rated this strong or better on "
+                        f"the model's 1-10 scale (default {MIN_STRENGTH}). "
+                        "Every candidate is kept in _clip_candidates_all.json, "
+                        "so retuning this does not need a re-run.")
+    p.add_argument("--top", type=int, default=0,
+                   help="after the strength filter, keep only the N strongest "
+                        "overall (default: no cap)")
+    p.add_argument("--per-chunk", type=int, default=MAX_CANDIDATES_PER_CHUNK,
+                   help=f"max candidates to keep from any one chunk "
+                        f"(default {MAX_CANDIDATES_PER_CHUNK})")
     p.add_argument("--limit-chunks", type=int, default=0,
                    help="score only the first N chunks (fast debug loop)")
     p.add_argument("--transcript-only", action="store_true",
@@ -759,19 +982,33 @@ def main(argv=None):
     report = []
     for i, chunk in enumerate(chunks, 1):
         say(f"  Chunk {i}/{len(chunks)} ({hms(chunk[0]['start'])}-{hms(chunk[-1]['end'])})...")
-        text = words_to_timestamped_text(chunk)
-        moments, diag = find_moments(text, i, args, debug_dir)
+        moments, diag = find_moments(chunk, i, args, debug_dir)
         all_moments.extend(moments)
         report.append(diag)
         say(f"    -> {len(moments)} candidate(s) [{diag['status']}]")
         for note in diag["notes"]:
             say(f"       note: {note}")
 
-    all_moments.sort(key=lambda m: m["start"])
+    # Strongest first, then the bar. Both steps are here in plain Python
+    # rather than left to the prompt, so the threshold is easy to move.
+    all_moments.sort(key=lambda m: (-m["strength"], m["start"]))
+    kept = [m for m in all_moments if m["strength"] >= args.min_strength]
+    below = len(all_moments) - len(kept)
+    if args.top and len(kept) > args.top:
+        cut = len(kept) - args.top
+        kept = kept[:args.top]
+    else:
+        cut = 0
+
+    # Everything scored, threshold included, so MIN_STRENGTH can be retuned
+    # against a real list instead of by re-running the whole pipeline.
+    all_path = base + "_clip_candidates_all.json"
+    with open(all_path, "w", encoding="utf-8") as f:
+        json.dump(all_moments, f, indent=2, ensure_ascii=False)
 
     out_path = base + "_clip_candidates.json"
     with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(all_moments, f, indent=2, ensure_ascii=False)
+        json.dump(kept, f, indent=2, ensure_ascii=False)
 
     report_path = base + "_clip_report.json"
     with open(report_path, "w", encoding="utf-8") as f:
@@ -785,8 +1022,21 @@ def main(argv=None):
                 "thinking": args.think,
                 "schema": args.schema,
                 "chunk_seconds": args.chunk_seconds,
+                "min_strength": args.min_strength,
+                "top": args.top,
+                "per_chunk": args.per_chunk,
+                "min_clip_seconds": MIN_CLIP_SECONDS,
+                "max_clip_seconds": MAX_CLIP_SECONDS,
+                "target_clip_seconds": list(TARGET_CLIP_SECONDS),
             },
-            "total_candidates": len(all_moments),
+            "total_candidates": len(kept),
+            "scored_before_filter": len(all_moments),
+            "dropped_below_min_strength": below,
+            "dropped_by_top": cut,
+            "strength_histogram": {
+                str(s): sum(1 for m in all_moments if m["strength"] == s)
+                for s in sorted({m["strength"] for m in all_moments}, reverse=True)
+            },
             "chunks": report,
         }, f, indent=2, ensure_ascii=False)
 
@@ -795,9 +1045,8 @@ def main(argv=None):
     empty = sum(1 for d in report if d["status"] == "empty")
     failed = sum(1 for d in report if d["status"] in ("parse_failed", "call_failed"))
 
-    say(f"\nFound {len(all_moments)} candidate moment(s) "
-        f"across {len(report)} chunk(s): {ok} produced clips, "
-        f"{empty} returned nothing, {failed} failed.")
+    say(f"\nScored {len(all_moments)} candidate(s) across {len(report)} chunk(s): "
+        f"{ok} produced clips, {empty} returned nothing, {failed} failed.")
     if failed:
         say("  ! Some chunks FAILED rather than found nothing. "
             f"Re-run with --debug and read {base}_debug/.")
@@ -805,12 +1054,29 @@ def main(argv=None):
         say("  ! Every chunk parsed cleanly and still returned nothing. "
             "That is a model/prompt result, not a parsing bug - "
             f"check {report_path}, then try --schema or a bigger --num-ctx.")
+
+    say(f"Kept {len(kept)} at strength >= {args.min_strength}"
+        + (f", top {args.top}" if args.top else "")
+        + f" ({below} below the bar"
+        + (f", {cut} past the top cap" if cut else "") + ").")
+    if all_moments and not kept:
+        say(f"  ! Nothing cleared strength {args.min_strength}. The scored list "
+            f"is in {os.path.basename(all_path)} - read it before lowering the "
+            "bar, the ratings may just be honest.")
+    if durations := [m["duration"] for m in kept]:
+        say(f"Durations: {min(durations):.0f}-{max(durations):.0f}s "
+            f"(target {TARGET_CLIP_SECONDS[0]}-{TARGET_CLIP_SECONDS[1]}s, "
+            f"floor {MIN_CLIP_SECONDS}s, ceiling {MAX_CLIP_SECONDS}s).")
     say(f"Saved: {out_path}")
+    say(f"Saved: {all_path}")
     say(f"Saved: {report_path}\n")
 
-    for m in all_moments:
-        say(f"  [{m['start']:7.1f}s - {m['end']:7.1f}s] "
-            f"({m['category']}) {m['hook_line']}")
+    for m in kept:
+        say(f"  [{m['start']:7.1f}s - {m['end']:7.1f}s] {m['duration']:4.0f}s  "
+            f"strength {m['strength']:2d}  ({m['category']})")
+        say(f"      hook: {m['hook_line']}")
+        excerpt = m["transcript_excerpt"]
+        say(f"      text: {excerpt[:200]}{'...' if len(excerpt) > 200 else ''}")
     return 0
 
 
