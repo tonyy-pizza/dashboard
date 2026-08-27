@@ -13,6 +13,12 @@ Two-piece desktop dashboard:
   spawns `collector.py` as a subprocess via `CollectorRunner` — that is the
   intended refresh mechanism.
 
+## Also in this repo
+
+- **`resolve_cutter.py`** — unrelated to the dashboard: cuts and centre-crops
+  vertical 1080x1920 clips in DaVinci Resolve from a `*_clip_candidates.json`
+  file. See [RESOLVE_CUTTER.md](RESOLVE_CUTTER.md).
+
 ## Setup
 
 ```
