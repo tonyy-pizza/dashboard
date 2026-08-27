@@ -335,14 +335,133 @@ def _seed_env():
     return module_dirs, notes
 
 
+def _has_scriptapp(module):
+    return callable(getattr(module, "scriptapp", None))
+
+
+def _exec_resolve_module(path):
+    """Run Blackmagic's DaVinciResolveScript.py and return what it *installs*.
+
+    The shipped file is a loader that ends with::
+
+        sys.modules[__name__] = script_module
+
+    -- it replaces itself in ``sys.modules`` with the native ``fusionscript``
+    module and never defines ``scriptapp`` in its own namespace. ``scriptapp``
+    lives on the native module.
+
+    ``import DaVinciResolveScript as dvr`` handles that for free, because the
+    import statement rebinds from ``sys.modules`` after execution. Loading the
+    file by path does not: ``exec_module`` leaves our local reference pointing
+    at the discarded shell, whose namespace is just ``os``/``sys``/
+    ``script_module``. Reading ``sys.modules`` back afterwards is what makes the
+    two paths equivalent.
+
+    Returns ``(installed, shell)``; ``installed is shell`` means no swap happened.
+    """
+    import importlib.util
+
+    name = "DaVinciResolveScript"
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ResolveError("could not build an import spec for %s" % path)
+    shell = importlib.util.module_from_spec(spec)
+
+    # Register before executing: the file assigns to sys.modules[__name__], and
+    # this is also what lets a module import itself mid-execution.
+    previous = sys.modules.get(name)
+    sys.modules[name] = shell
+    try:
+        spec.loader.exec_module(shell)
+    except Exception as exc:
+        if previous is not None:
+            sys.modules[name] = previous
+        else:
+            sys.modules.pop(name, None)
+        hint = ""
+        if isinstance(exc, ImportError) and "imp" in str(exc) and sys.version_info >= (3, 12):
+            hint = ("\nThe shipped loader uses the `imp` module, removed in Python 3.12. "
+                    "Run this under Python 3.11 or older, or use a Resolve version whose "
+                    "scripting module was updated to importlib.")
+        raise ResolveError(
+            "found %s but it failed to load: %s: %s\n"
+            "This is usually RESOLVE_SCRIPT_LIB pointing at the wrong fusionscript "
+            "library (or none at all).%s" % (path, type(exc).__name__, exc, hint)
+        )
+    return sys.modules.get(name, shell), shell
+
+
+def _load_fusionscript_direct():
+    """Last resort: load the native fusionscript library ourselves.
+
+    This is exactly what Blackmagic's loader does internally, minus the `imp`
+    module it uses to do it (removed in Python 3.12). Useful when the shipped
+    .py is missing or unrunnable but the library itself is fine.
+    """
+    import importlib.machinery
+    import importlib.util
+
+    plat = "win32" if sys.platform.startswith("win") else ("darwin" if sys.platform == "darwin" else "linux")
+    candidates = []
+    if os.environ.get("RESOLVE_SCRIPT_LIB"):
+        candidates.append(os.environ["RESOLVE_SCRIPT_LIB"])
+    candidates.extend(_SCRIPT_LIBS.get(plat, []))
+
+    for lib in candidates:
+        if not lib or not os.path.isfile(lib):
+            continue
+        try:
+            loader = importlib.machinery.ExtensionFileLoader("fusionscript", lib)
+            spec = importlib.util.spec_from_loader("fusionscript", loader)
+            module = importlib.util.module_from_spec(spec)
+            loader.exec_module(module)
+        except Exception:
+            continue
+        if _has_scriptapp(module):
+            return module, lib
+    return None, None
+
+
+def _diagnose_missing_scriptapp(path, installed, shell):
+    """Explain a module that loaded cleanly but has no scriptapp."""
+    names = sorted(n for n in vars(installed) if not n.startswith("__"))
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = -1
+    lib = os.environ.get("RESOLVE_SCRIPT_LIB") or "(unset)"
+    lib_state = "exists" if (lib != "(unset)" and os.path.isfile(lib)) else "MISSING"
+    return (
+        "%s executed without error but exposes no scriptapp().\n"
+        "  file size          : %d bytes\n"
+        "  sys.modules swap   : %s\n"
+        "  names defined      : %s\n"
+        "  RESOLVE_SCRIPT_LIB : %s (%s)\n"
+        "  python             : %s (%d-bit)\n"
+        "If the swap did not happen, the file's internal fusionscript load failed "
+        "silently -- which points at RESOLVE_SCRIPT_LIB above, or a Resolve "
+        "install whose Developer/Scripting folder is stale."
+        % (path, size,
+           "no -- module did not replace itself" if installed is shell else "yes",
+           ", ".join(names) or "(none)",
+           lib, lib_state,
+           sys.version.split()[0], 64 if sys.maxsize > 2 ** 32 else 32)
+    )
+
+
 def load_resolve_module():
     """Import DaVinciResolveScript, falling back to the on-disk module path.
 
     Returns ``(module, notes)`` where notes describe what had to be inferred --
     ``--check`` prints them so a mis-set environment is visible rather than
     silently papered over.
+
+    Whatever is returned is guaranteed to expose ``scriptapp``; a module that
+    loads but cannot provide it fails here, loudly, rather than at the call site.
     """
     module_dirs, notes = _seed_env()
+    problems = []
+
     # Bind the error to a name that outlives the except block -- Python 3
     # unbinds `as exc` on the way out, and this message is the first thing a
     # user with an unconfigured environment ever sees.
@@ -350,12 +469,14 @@ def load_resolve_module():
     try:
         import DaVinciResolveScript as dvr  # noqa: F401  (PYTHONPATH already correct)
 
-        notes.append("imported DaVinciResolveScript from PYTHONPATH: %s" % getattr(dvr, "__file__", "?"))
-        return dvr, notes
+        if _has_scriptapp(dvr):
+            notes.append("imported DaVinciResolveScript from PYTHONPATH: %s"
+                         % getattr(dvr, "__file__", "?"))
+            return dvr, notes
+        problems.append("the DaVinciResolveScript on PYTHONPATH (%s) has no scriptapp()"
+                        % getattr(dvr, "__file__", "?"))
     except ImportError as exc:
         first_err = exc
-
-    import importlib.util
 
     tried = []
     for directory in module_dirs:
@@ -363,20 +484,29 @@ def load_resolve_module():
         tried.append(path)
         if not os.path.isfile(path):
             continue
-        spec = importlib.util.spec_from_file_location("DaVinciResolveScript", path)
-        module = importlib.util.module_from_spec(spec)
-        try:
-            spec.loader.exec_module(module)
-        except Exception as exc:  # the module raises if fusionscript is missing
-            raise ResolveError(
-                "found %s but it failed to load: %s\n"
-                "This is almost always RESOLVE_SCRIPT_LIB pointing at the wrong "
-                "fusionscript library (or none at all)." % (path, exc)
-            )
-        sys.modules["DaVinciResolveScript"] = module
-        notes.append("imported DaVinciResolveScript from %s" % path)
-        return module, notes
+        installed, shell = _exec_resolve_module(path)
+        if _has_scriptapp(installed):
+            notes.append("loaded %s" % path)
+            if installed is not shell:
+                notes.append("  (it swapped itself for the native %s module, as it should)"
+                             % getattr(installed, "__name__", "fusionscript"))
+            return installed, notes
+        problems.append(_diagnose_missing_scriptapp(path, installed, shell))
 
+    # Nothing usable via the shipped loader -- try the native library directly.
+    direct, lib = _load_fusionscript_direct()
+    if direct is not None:
+        notes.append("loaded the native fusionscript library directly: %s" % lib)
+        notes.append("  (the shipped DaVinciResolveScript.py was missing or unusable)")
+        return direct, notes
+
+    if problems:
+        raise ResolveError(
+            "DaVinciResolveScript was found but is not usable.\n\n%s\n\n"
+            "Loading the native library directly did not work either. Repair or "
+            "reinstall DaVinci Resolve's Developer/Scripting component."
+            % "\n\n".join(problems)
+        )
     raise ResolveError(
         "could not import DaVinciResolveScript (%s).\n"
         "Looked in:\n  %s\n"

@@ -112,16 +112,62 @@ Format and codec are resolved by searching `GetRenderFormats()` /
 `GetRenderCodecs()` for MP4 and H.264 rather than hardcoding an identifier, since
 those vary by version and platform (`H264`, `H.264`, hardware variants).
 
+## Troubleshooting the connection
+
+**`AttributeError: module 'DaVinciResolveScript' has no attribute 'scriptapp'`**
+
+Fixed in the loader — if you still see it, you are on an older copy of this script.
+
+Blackmagic's shipped `DaVinciResolveScript.py` is a loader that ends with:
+
+```python
+sys.modules[__name__] = script_module
+```
+
+It **replaces itself** in `sys.modules` with the native `fusionscript` module, and
+never defines `scriptapp` in its own namespace — `scriptapp` lives on the native
+module. `import DaVinciResolveScript as dvr` handles that for free, because the
+import statement rebinds from `sys.modules` after the module body runs.
+
+Loading the file *by path* does not. `exec_module()` leaves your reference pointing
+at the discarded shell, whose namespace is only `os`, `sys`, `script_module`. The
+loader now reads `sys.modules` back after executing, which makes both paths
+equivalent. It also no longer overwrites the correct module the file just installed.
+
+This only ever bit the by-path fallback, i.e. when `PYTHONPATH` does **not** expose
+the module — which is why it doesn't show up in any of the Blackmagic guides.
+
+**Anything returned by the loader is now guaranteed to expose `scriptapp()`.** A
+module that loads cleanly but can't provide it fails immediately with a diagnostic
+covering the questions worth asking — which file was loaded and its size, whether
+the `sys.modules` swap was reached, what names the module did define, whether
+`RESOLVE_SCRIPT_LIB` resolves to a real file, and the Python version and
+architecture. If the swap never happened, the file's internal native-library load
+failed silently, and it really is `RESOLVE_SCRIPT_LIB` or a stale
+`Developer/Scripting` folder — repair that install.
+
+If the shipped `.py` is missing or unusable, the loader falls back to loading the
+native `fusionscript` library directly. That also covers **Python 3.12+**, where
+Blackmagic's file fails outright because it uses `imp`, removed in that release —
+the error calls this out explicitly. Running under Python 3.11 or older is the
+other way out.
+
+**`scriptapp('Resolve')` returned `None`** — the module is fine and the connection
+isn't. Resolve running (not just installed)? "External scripting using" set to
+`Local`, with Resolve restarted after the change? Python and Resolve the same
+64-bit architecture?
+
 ## Tests
 
 ```
 python test_resolve_cutter.py
 ```
 
-76 tests. The frame maths, zoom maths, slug generation and JSON parsing are tested
+86 tests. The frame maths, zoom maths, slug generation and JSON parsing are tested
 directly; the whole build-and-render pass runs against a fake Resolve object graph
 that checks the call *sequence* — in/out points reaching `AppendToTimeline`,
 timeline resolution landing before the clip does, the render poll actually waiting.
+Module loading is covered against a replica of Blackmagic's self-swapping loader.
 
 **What the tests cannot tell you:** the fake answers the way Blackmagic's docs and
 community scripts say Resolve answers. Only the live application can confirm that

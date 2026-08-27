@@ -825,6 +825,150 @@ class TestConnectionErrors(unittest.TestCase):
         self.assertIn("running", msg)
 
 
+BLACKMAGIC_SHAPED_LOADER = """
+import sys
+import os
+
+script_module = None
+try:
+    import fusionscript as script_module
+except ImportError:
+    pass
+
+if script_module:
+    # The line that broke the fallback loader: the module swaps ITSELF out.
+    sys.modules[__name__] = script_module
+else:
+    raise ImportError("Could not locate module dependencies")
+"""
+
+FAKE_NATIVE = """
+def scriptapp(name):
+    return "<app:%s>" % name
+"""
+
+
+class TestModuleLoading(unittest.TestCase):
+    """Regression cover for the sys.modules self-swap in Blackmagic's loader.
+
+    The shipped DaVinciResolveScript.py ends with
+    ``sys.modules[__name__] = script_module``, so the object worth having is the
+    one left in sys.modules -- not the shell handed to exec_module. Loading by
+    path has to read that back or `scriptapp` goes missing.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.modules = os.path.join(self.dir, "Modules")
+        os.makedirs(self.modules)
+        self._real_dirs = rc._MODULE_DIRS
+        self._real_libs = rc._SCRIPT_LIBS
+        self._real_path = list(sys.path)
+        self._real_lib_env = os.environ.get("RESOLVE_SCRIPT_LIB")
+        self._saved = sys.modules.pop("DaVinciResolveScript", None)
+        sys.modules.pop("fusionscript", None)
+        # No native library anywhere, so the direct fallback cannot mask a bug.
+        rc._SCRIPT_LIBS = {"win32": [], "darwin": [], "linux": []}
+        os.environ.pop("RESOLVE_SCRIPT_LIB", None)
+
+    def tearDown(self):
+        rc._MODULE_DIRS = self._real_dirs
+        rc._SCRIPT_LIBS = self._real_libs
+        sys.path[:] = self._real_path
+        sys.modules.pop("DaVinciResolveScript", None)
+        sys.modules.pop("fusionscript", None)
+        if self._saved is not None:
+            sys.modules["DaVinciResolveScript"] = self._saved
+        if self._real_lib_env is None:
+            os.environ.pop("RESOLVE_SCRIPT_LIB", None)
+        else:
+            os.environ["RESOLVE_SCRIPT_LIB"] = self._real_lib_env
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def write_loader(self, body=BLACKMAGIC_SHAPED_LOADER, native=FAKE_NATIVE):
+        with open(os.path.join(self.modules, "DaVinciResolveScript.py"), "w") as fh:
+            fh.write(body)
+        if native is not None:
+            with open(os.path.join(self.dir, "fusionscript.py"), "w") as fh:
+                fh.write(native)
+            sys.path.insert(0, self.dir)
+        rc._MODULE_DIRS = {"win32": [self.modules], "darwin": [self.modules],
+                           "linux": [self.modules]}
+
+    def test_self_swapping_loader_still_yields_scriptapp(self):
+        # The exact reported bug: exec_module raises nothing, the file is
+        # genuine, and the returned module has no scriptapp.
+        self.write_loader()
+        module, notes = rc.load_resolve_module()
+        self.assertTrue(hasattr(module, "scriptapp"),
+                        "returned the pre-swap shell instead of the native module")
+        self.assertEqual(module.scriptapp("Resolve"), "<app:Resolve>")
+
+    def test_returned_module_is_the_one_left_in_sys_modules(self):
+        self.write_loader()
+        module, _ = rc.load_resolve_module()
+        self.assertIs(sys.modules["DaVinciResolveScript"], module)
+
+    def test_the_swap_is_reported_in_the_notes(self):
+        self.write_loader()
+        _, notes = rc.load_resolve_module()
+        self.assertTrue(any("swapped itself" in n for n in notes))
+
+    def test_loader_without_scriptapp_raises_instead_of_returning_it(self):
+        # A module that loads clean but cannot provide scriptapp must fail here,
+        # loudly -- not at the call site with a bare AttributeError.
+        self.write_loader(body="import sys, os\nscript_module = None\n", native=None)
+        with self.assertRaises(rc.ResolveError) as ctx:
+            rc.load_resolve_module()
+        self.assertIn("no scriptapp", str(ctx.exception))
+
+    def test_diagnostic_answers_the_obvious_questions(self):
+        self.write_loader(body="import sys, os\nscript_module = None\n", native=None)
+        os.environ["RESOLVE_SCRIPT_LIB"] = os.path.join(self.dir, "nope.dll")
+        with self.assertRaises(rc.ResolveError) as ctx:
+            rc.load_resolve_module()
+        msg = str(ctx.exception)
+        self.assertIn("did not replace itself", msg)   # was the swap reached?
+        self.assertIn("file size", msg)                # is the file truncated?
+        self.assertIn("MISSING", msg)                  # does the lib resolve?
+        self.assertIn("script_module", msg)            # what did get defined?
+
+    def test_loader_that_raises_is_still_reported_as_a_load_failure(self):
+        self.write_loader(native=None)  # no fusionscript -> the file raises
+        with self.assertRaises(rc.ResolveError) as ctx:
+            rc.load_resolve_module()
+        self.assertIn("failed to load", str(ctx.exception))
+
+    def test_failed_load_does_not_leave_a_broken_sys_modules_entry(self):
+        self.write_loader(native=None)
+        with self.assertRaises(rc.ResolveError):
+            rc.load_resolve_module()
+        self.assertNotIn("DaVinciResolveScript", sys.modules)
+
+    def test_plain_import_path_is_validated_too(self):
+        # A scriptapp-less module already on PYTHONPATH must not be trusted
+        # just because `import` succeeded.
+        shell = type(sys)("DaVinciResolveScript")
+        shell.__file__ = "/fake/on/pythonpath.py"
+        sys.modules["DaVinciResolveScript"] = shell
+        self.write_loader()
+        module, _ = rc.load_resolve_module()
+        self.assertTrue(hasattr(module, "scriptapp"))
+
+    def test_direct_native_fallback_fails_cleanly_when_nothing_exists(self):
+        module, lib = rc._load_fusionscript_direct()
+        self.assertIsNone(module)
+        self.assertIsNone(lib)
+
+    def test_python_312_imp_removal_is_called_out(self):
+        self.write_loader(body="import imp\n", native=None)
+        if sys.version_info < (3, 12):
+            self.skipTest("the `imp` module still exists on this interpreter")
+        with self.assertRaises(rc.ResolveError) as ctx:
+            rc.load_resolve_module()
+        self.assertIn("3.12", str(ctx.exception))
+
+
 class TestPreflight(FakeRunCase):
     def test_check_creates_nothing(self):
         args = self.args(check=True)
