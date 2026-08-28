@@ -48,6 +48,11 @@ What v3.0 changed and why:
     6. Recency is enforced locally (decay + hard cutoff) rather than trusted
        to Reddit's `t=` parameter, which is ignored for `sort=new`.
 
+    7. Negated keywords flip polarity. v2 read "failed to beat" as a positive
+       hit and "lawsuit dismissed" as a negative one. A negator within a few
+       tokens now flips the keyword, and the flip is reported so the reader
+       can see it happened.
+
 Setup:
     pip install yfinance requests
 
@@ -55,8 +60,10 @@ Usage:
     py public_sentiment.py
 
 Notes:
-    - This is keyword/rule-based sentiment, not true AI interpretation. It has
-      no negation handling: "failed to beat" reads as positive.
+    - This is keyword/rule-based sentiment, not true AI interpretation.
+      Negation is a token-window heuristic, not parsing: it catches
+      "failed to beat" and "strike averted", but not sarcasm or negation
+      spread across clauses.
     - Reddit's unauthenticated JSON endpoints are frequently blocked (403) or
       rate limited (429). The report says so explicitly rather than silently
       reporting a neutral Reddit reading.
@@ -185,7 +192,8 @@ def clamp(x: float, low: float = 0.0, high: float = 10.0) -> float:
 POSITIVE_KEYWORDS = {
     "earnings": [
         "beat", "beats", "record earnings", "strong earnings", "earnings growth",
-        "raises guidance", "raised guidance", "guidance raised", "outperform",
+        "raises guidance", "raise guidance", "raised guidance", "guidance raised",
+        "outperform",
         "better than expected", "above expectations", "profit rises", "profits rise",
         "revenue growth", "margin expansion", "free cash flow growth"
     ],
@@ -196,7 +204,8 @@ POSITIVE_KEYWORDS = {
         "approval", "permit approved", "development progress", "commissioning"
     ],
     "capital_returns": [
-        "dividend increase", "raises dividend", "buyback", "share repurchase",
+        "dividend increase", "raises dividend", "raise dividend", "buyback",
+        "share repurchase",
         "returns capital", "special dividend"
     ],
     "market": [
@@ -338,6 +347,48 @@ TARGET_SUBREDDITS = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# NEGATION
+#
+# Bag-of-words scoring reads "failed to beat" as positive. These lists let a
+# nearby negator flip a keyword's polarity instead.
+# ─────────────────────────────────────────────────────────────────────────────
+
+NEGATION_WINDOW = 4            # tokens before a match that may negate it
+NEGATION_TRAILING_WINDOW = 2   # tokens after a match that may cancel it
+
+NEGATION_PRECEDING = [
+    "not", "no", "never", "without", "nothing", "none",
+    "fail to", "fails to", "failed to", "failing to",
+    "unable to", "cannot", "can not", "can't", "could not", "couldn't",
+    "does not", "doesn't", "did not", "didn't", "do not", "don't",
+    "is not", "isn't", "was not", "wasn't", "are not", "aren't",
+    "were not", "weren't", "will not", "won't", "would not", "wouldn't",
+    "has not", "hasn't", "have not", "haven't", "had not", "hadn't",
+    "lacks", "lacking", "absent", "short of", "stops short of",
+    "denies", "deny", "denied", "rules out", "ruled out",
+    "avoids", "avoid", "avoided", "averts", "averted", "escapes", "escaped",
+    "far from", "instead of", "rather than",
+]
+
+NEGATION_FOLLOWING = [
+    "dismissed", "dropped", "averted", "avoided", "withdrawn", "reversed",
+    "overturned", "resolved", "settled", "lifted", "cleared", "scrapped",
+    "called off", "abandoned", "rescinded", "thrown out",
+]
+
+# Trailing negation is risky next to an earnings phrase ("profit falls,
+# dropped 12%"), so it only applies to legal/operational events.
+NEGATION_FOLLOWING_APPLIES_TO = {
+    "lawsuit", "investigation", "probe", "probes", "strike", "shutdown",
+    "penalty", "fined", "fines", "suspended", "permit denied",
+    "environmental violation", "integration risk", "debt concern",
+    "liquidity concern", "impairment", "delay", "delays", "delayed",
+}
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9$']+")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TEXT HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -368,39 +419,143 @@ def word_boundary_match(text: str, term: str) -> bool:
     return _boundary_pattern(term).search(text) is not None
 
 
-def dedupe_nested_hits(hits: List[str]) -> List[str]:
+def _token_spans(text: str) -> List[str]:
+    return _TOKEN_RE.findall(text.lower())
+
+
+def _before_window(text: str, start: int) -> str:
     """
-    Collapse hits contained in longer hits from the same text, so
-    "strategic acquisition" scores 1 rather than 2 (it also matched
-    "acquisition"), and "production miss" does not also score "miss".
+    The few tokens immediately preceding a match, stopping at a sentence
+    boundary so "Revenue grew. Not a good quarter" does not negate "grew".
     """
-    out = []
-    for a in hits:
-        if any(a != b and word_boundary_match(b, a) for b in hits):
-            continue
-        out.append(a)
-    return out
+    chunk = text[:start]
+    cut = max((chunk.rfind(c) for c in ".!?;"), default=-1)
+    if cut != -1:
+        chunk = chunk[cut + 1:]
+    return " ".join(_token_spans(chunk)[-NEGATION_WINDOW:])
+
+
+def _after_window(text: str, end: int) -> str:
+    chunk = text[end:]
+    for c in ".!?;":
+        i = chunk.find(c)
+        if i != -1:
+            chunk = chunk[:i]
+    return " ".join(_token_spans(chunk)[:NEGATION_TRAILING_WINDOW])
+
+
+def is_negated(text: str, start: int, end: int, keyword: str) -> bool:
+    """
+    True when the match at [start:end] is negated.
+
+    Leading negation applies to any sentiment keyword ("failed to beat",
+    "did not raise guidance"). Trailing negation applies only to the
+    legal/operational keywords listed in NEGATION_FOLLOWING_APPLIES_TO
+    ("lawsuit dismissed", "strike averted"), because a trailing "dropped" or
+    "reversed" next to an earnings phrase usually describes the number rather
+    than cancelling the event.
+    """
+    before = _before_window(text, start)
+    if before and any(word_boundary_match(before, n) for n in NEGATION_PRECEDING):
+        return True
+
+    if keyword.lower() in NEGATION_FOLLOWING_APPLIES_TO:
+        after = _after_window(text, end)
+        if after and any(word_boundary_match(after, n) for n in NEGATION_FOLLOWING):
+            return True
+
+    return False
+
+
+def find_keyword_spans(
+    text: str,
+    keywords: List[str],
+    apply_guards: bool = True,
+) -> List[Tuple[str, int, int]]:
+    """
+    Every whole-word occurrence as (keyword, start, end), with guarded
+    keywords voided and occurrences swallowed by a longer match at the same
+    position dropped -- so "strategic acquisition" is one hit, not also
+    "acquisition", while a standalone "acquisition" elsewhere still counts.
+    """
+    if not text:
+        return []
+
+    spans: List[Tuple[str, int, int]] = []
+    for kw in keywords:
+        if apply_guards:
+            guards = KEYWORD_GUARDS.get(kw.lower())
+            if guards and any(word_boundary_match(text, g) for g in guards):
+                continue
+        for m in _boundary_pattern(kw).finditer(text):
+            spans.append((kw, m.start(), m.end()))
+
+    kept = []
+    for kw, start, end in spans:
+        swallowed = any(
+            s2 <= start and end <= e2 and (e2 - s2) > (end - start)
+            for _, s2, e2 in spans
+        )
+        if not swallowed:
+            kept.append((kw, start, end))
+    return kept
 
 
 def contains_any(text: str, keywords: List[str], apply_guards: bool = True) -> List[str]:
     """
-    Return the distinct keywords present in `text` as whole words, with nested
-    matches collapsed and guarded keywords voided.
+    The distinct keywords present in `text` as whole words. One item counts a
+    keyword once however often it repeats.
+    """
+    seen = set()
+    out = []
+    for kw, _, _ in find_keyword_spans(text, keywords, apply_guards=apply_guards):
+        key = kw.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(kw)
+    return out
+
+
+def classify_polarity(
+    text: str,
+    positive_words: List[str],
+    negative_words: List[str],
+) -> Tuple[List[str], List[str], int]:
+    """
+    Split a text's sentiment keywords into positive and negative, flipping
+    negated ones.
+
+    A keyword flips only if EVERY occurrence of it in the text is negated, so
+    "they beat on revenue but did not beat on margin" still registers the
+    unnegated hit. Flipped hits are labelled so the report shows why a
+    positive word landed in the negative column.
+
+    Negation is applied to polarity only. The catalyst/macro/hype gauges
+    measure how much a topic is discussed, and "no lawsuit" is still lawsuit
+    coverage.
     """
     if not text:
-        return []
-    hits = [kw for kw in keywords if word_boundary_match(text, kw)]
+        return [], [], 0
 
-    if apply_guards:
-        kept = []
-        for kw in hits:
-            guards = KEYWORD_GUARDS.get(kw.lower())
-            if guards and any(word_boundary_match(text, g) for g in guards):
-                continue
-            kept.append(kw)
-        hits = kept
+    positive_hits: List[str] = []
+    negative_hits: List[str] = []
+    flips = 0
 
-    return dedupe_nested_hits(hits)
+    for is_positive, words in ((True, positive_words), (False, negative_words)):
+        grouped: Dict[str, List[Tuple[int, int]]] = {}
+        for kw, start, end in find_keyword_spans(text, words):
+            grouped.setdefault(kw, []).append((start, end))
+
+        for kw, occurrences in grouped.items():
+            negated = all(is_negated(text, s, e, kw) for s, e in occurrences)
+            if negated:
+                flips += 1
+                label = f"{kw} (negated)"
+                (negative_hits if is_positive else positive_hits).append(label)
+            else:
+                (positive_hits if is_positive else negative_hits).append(kw)
+
+    return positive_hits, negative_hits, flips
 
 
 def normalize_company_name(name: Optional[str]) -> str:
@@ -1033,6 +1188,7 @@ def _empty_scores(note: str) -> Dict[str, Any]:
         "macro_hits": [],
         "item_count": 0,
         "dropped_stale": 0,
+        "negation_flips": 0,
         "interpretation": note,
     }
 
@@ -1056,6 +1212,8 @@ def score_items(
         combined view.
       - confidence reflects recency-decayed volume, source diversity AND
         agreement between items, rather than raw item count alone.
+      - negated keywords flip polarity, so "failed to beat" no longer counts
+        as a positive hit.
     """
     now_epoch = now_epoch if now_epoch is not None else dt.datetime.now(dt.timezone.utc).timestamp()
 
@@ -1080,6 +1238,7 @@ def score_items(
 
     usable_count = 0
     dropped_stale = 0
+    negation_flips = 0
     total_engagement = 0.0
 
     for item in items:
@@ -1114,8 +1273,8 @@ def score_items(
 
         weight = max(weight, 1e-6)
 
-        ph = contains_any(combined, positive_words)
-        nh = contains_any(combined, negative_words)
+        ph, nh, flips = classify_polarity(combined, positive_words, negative_words)
+        negation_flips += flips
         ch = contains_any(combined, CATALYST_KEYWORDS)
         hh = contains_any(combined, HYPE_KEYWORDS)
         mh = contains_any(combined, MACRO_GEOPOLITICAL_KEYWORDS)
@@ -1187,6 +1346,7 @@ def score_items(
         "macro_hits": most_common(macro_hits),
         "item_count": usable_count,
         "effective_item_count": round(effective_count, 2),
+        "negation_flips": negation_flips,
         "dropped_stale": dropped_stale,
         "distinct_sources": len(distinct_sources),
         "interpretation": interpret_sentiment(
@@ -1203,9 +1363,10 @@ def interpret_sentiment(
     macro: float,
     confidence: float,
 ) -> str:
-    if confidence < 3:
-        base = "Low-confidence reading due to limited relevant data."
-    elif overall >= 7.5:
+    # The direction is always stated. Low confidence qualifies the reading
+    # rather than replacing it, so the words never go silent on a score the
+    # reader can see printed directly above them.
+    if overall >= 7.5:
         base = "Public sentiment appears positive."
     elif overall >= 6.0:
         base = "Public sentiment appears mildly positive."
@@ -1215,6 +1376,9 @@ def interpret_sentiment(
         base = "Public sentiment appears mildly negative."
     else:
         base = "Public sentiment appears negative."
+
+    if confidence < 3:
+        base = base.rstrip(".") + ", but this is a low-confidence reading built on thin data."
 
     notes = []
 
@@ -1324,9 +1488,7 @@ def interpret_combined(
     if combined_score is None:
         return "No combined reading is available."
 
-    if confidence < 3:
-        base = "Combined sentiment is low-confidence because source coverage is thin."
-    elif combined_score >= 7.5:
+    if combined_score >= 7.5:
         base = "Combined public sentiment is positive."
     elif combined_score >= 6.0:
         base = "Combined public sentiment is mildly positive."
@@ -1336,6 +1498,9 @@ def interpret_combined(
         base = "Combined public sentiment is mildly negative."
     else:
         base = "Combined public sentiment is negative."
+
+    if confidence < 3:
+        base = base.rstrip(".") + ", but source coverage is too thin to rely on."
 
     if len(contributing) == 1:
         missing = "Reddit" if contributing[0] == "yahoo" else "Yahoo Finance"
@@ -1423,6 +1588,10 @@ def print_score_rows(scores: Dict[str, Any]) -> None:
     ]
     for label, value, kind in gauge_rows:
         print(f"  {label:<30} {bar(value, 14)}  {colour_score(value, kind=kind)} / 10")
+
+    flips = scores.get("negation_flips", 0)
+    if flips:
+        print(f"  {DIM}({flips} keyword(s) flipped by negation, e.g. \"failed to beat\"){RESET}")
 
     stale = scores.get("dropped_stale", 0)
     if stale:
@@ -1587,7 +1756,7 @@ def print_sentiment_report(result: Dict[str, Any]) -> None:
     print()
     rule()
     print(f"  {YELLOW}⚠  Sentiment is a screening layer only. It is not financial advice and should not override fundamentals.{RESET}")
-    print(f"  {YELLOW}⚠  Keyword scoring has no negation handling: \"failed to beat\" reads as positive.{RESET}")
+    print(f"  {YELLOW}⚠  Negation is handled by a {NEGATION_WINDOW}-token window, not by parsing. Sarcasm and complex clauses still fool it.{RESET}")
     print(f"  {YELLOW}⚠  Scores are not comparable across tickers without a peer baseline.{RESET}")
     rule()
     print()
