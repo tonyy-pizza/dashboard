@@ -19,9 +19,16 @@ Two-piece desktop dashboard:
   HTTP session, the on-disk JSON cache (`cache\financials`, `cache\prices`, `cache\screener`),
   the retry/backoff policy and ticker identity resolution. **Nothing else
   should call yfinance directly** — import `get_info`, `get_price_history`,
-  `get_avg_volume`, `cached_screener` or `dedupe_tickers` from here. Network
+  `get_avg_volume`, `screen_page` or `dedupe_tickers` from here. Network
   failures come back as `None` (or a stale cache entry), never as an
   exception. Run `py market_data.py` for its self-test.
+- **`universe_screen.py`** — Stage 0 of the scan pipeline. Runs a deliberately
+  loose `EquityQuery` (P/E ceiling, volume floor, market-cap floor, US by
+  default, `--include-canada` for TSX) once per sector, pages through the
+  results 250 at a time, collapses cross-listings and dual-class shares with
+  `dedupe_tickers()`, and writes `data\candidates.json`. Fine-grained filtering
+  is a downstream job; this file only casts the net. Rows are tagged with their
+  listing currency and never sorted or compared across currencies.
 
 ## Setup
 

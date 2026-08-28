@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -70,6 +71,9 @@ CACHE_DIR = Path(os.environ.get("STOCKS_CACHE_DIR") or (BASE_DIR / "cache"))
 # these; anything unrecognized falls back to DEFAULT_CACHE_TYPE.
 CACHE_TYPES = ("financials", "prices", "screener")
 DEFAULT_CACHE_TYPE = "financials"
+
+# Yahoo caps a single screen call at 250 rows; callers paginate with offset.
+SCREEN_PAGE_MAX = 250
 
 # Named TTLs (seconds). Fundamentals move quarterly, prices and screens daily.
 TTL_FINANCIALS = 7 * 24 * 60 * 60   # 7 days
@@ -518,6 +522,51 @@ def get_company_name(ticker: str, info: Optional[dict] = None) -> Optional[str]:
     return None
 
 
+def screen_page(query,
+                offset: int = 0,
+                size: int = SCREEN_PAGE_MAX,
+                sort_field: str = "ticker",
+                sort_asc: bool = True,
+                ttl: float = TTL_SCREENER,
+                cache_key: Optional[str] = None,
+                force_refresh: bool = False) -> Optional[dict]:
+    """One page of a yfinance screen, cached under cache\\screener\\.
+
+    The only place yf.screen() is called - screener scripts build an
+    EquityQuery (pure, offline) and page through it here, so the session,
+    cache and backoff policy stay in this module.
+
+    `query` is an EquityQuery/FundQuery/ETFQuery or a predefined screen name.
+    Returns Yahoo's raw payload ({"start", "count", "total", "quotes"}) or
+    None if the page could not be fetched. An empty "quotes" list is a valid
+    payload - it just means the offset is past the end of the results.
+    """
+    size = max(1, min(int(size), SCREEN_PAGE_MAX))
+    offset = max(0, int(offset))
+
+    if cache_key is None:
+        try:
+            shape = json.dumps(query.to_dict(), sort_keys=True)
+        except Exception:
+            shape = str(query)
+        cache_key = "screen_" + hashlib.md5(shape.encode("utf-8")).hexdigest()[:10]
+    key = f"{cache_key}_off{offset}_sz{size}"
+
+    def _fetch():
+        payload = yf.screen(query, offset=offset, size=size,
+                            sortField=sort_field, sortAsc=sort_asc,
+                            session=get_session())
+        if not isinstance(payload, dict) or "quotes" not in payload:
+            raise ValueError(f"unexpected screen payload for {key}: {type(payload).__name__}")
+        return payload
+
+    return cached_fetch(key,
+                        lambda: fetch_with_backoff(_fetch),
+                        ttl,
+                        cache_type="screener",
+                        force_refresh=force_refresh)
+
+
 def cached_screener(name: str,
                     fetch_fn: Callable[[], Any],
                     ttl: float = TTL_SCREENER,
@@ -555,8 +604,10 @@ _SHARE_NOISE = {
 
 _DROP_TOKENS = _LEGAL_SUFFIXES | _SHARE_NOISE
 
-# "Class A", "cl. B", "Series C" anywhere in the name.
-_CLASS_RE = re.compile(r"\b(?:class|cl|series|ser)\.?\s*[a-z0-9]{1,3}\b")
+# "Class A", "cl. B", "Series C" anywhere in the name. The separator after
+# the marker is required, otherwise "cl" swallows the front of words like
+# "Clean", "Clear" and "Cloud" and merges unrelated companies.
+_CLASS_RE = re.compile(r"\b(?:class|cl|series|ser)(?:\.\s*|\s+)[a-z0-9]{1,3}\b")
 _PARENS_RE = re.compile(r"\([^)]*\)")
 
 
@@ -588,7 +639,9 @@ def normalize_company_name(name: Optional[str]) -> str:
 
 
 def dedupe_tickers(ticker_list: Iterable[str],
-                   ttl: float = TTL_FINANCIALS) -> tuple:
+                   ttl: float = TTL_FINANCIALS,
+                   names: Optional[dict] = None,
+                   volumes: Optional[dict] = None) -> tuple:
     """Collapse tickers that are the same underlying company.
 
     Dual-class listings (GOOGL/GOOG, BRK-A/BRK-B) and cross-listings
@@ -599,6 +652,12 @@ def dedupe_tickers(ticker_list: Iterable[str],
 
     Tickers whose name cannot be fetched are always kept: a network failure
     must never silently shrink the universe.
+
+    `names` / `volumes` let a caller supply what it already knows (a screener
+    payload carries both), keyed by symbol. Anything supplied is used as-is;
+    anything missing is looked up with get_info()/get_avg_volume(). Passing
+    them turns a several-hundred-ticker dedupe from one request per ticker
+    into no requests at all.
 
     Returns (deduped_list, dropped_list). deduped_list is the surviving
     tickers in input order; dropped_list holds dicts of
@@ -623,16 +682,21 @@ def dedupe_tickers(ticker_list: Iterable[str],
         ordered.append(symbol)
 
     position = {symbol: i for i, symbol in enumerate(ordered)}
+    known_names = {str(k).strip().upper(): v for k, v in (names or {}).items()}
+    known_volumes = {str(k).strip().upper(): v for k, v in (volumes or {}).items()}
     groups: dict = {}
-    names: dict = {}
+    resolved_names: dict = {}
     infos: dict = {}
     unresolved: list = []
 
     for symbol in ordered:
-        info = get_info(symbol, ttl=ttl)
+        info = None
+        name = known_names.get(symbol)
+        if name is None:
+            info = get_info(symbol, ttl=ttl)
+            name = get_company_name(symbol, info=info)
         infos[symbol] = info
-        name = get_company_name(symbol, info=info)
-        names[symbol] = name
+        resolved_names[symbol] = name
         key = normalize_company_name(name)
         if not key:
             # No name (network failure, delisted, odd instrument) - keep it.
@@ -648,11 +712,15 @@ def dedupe_tickers(ticker_list: Iterable[str],
             keep.add(members[0])
             continue
 
-        volumes = {symbol: (get_avg_volume(symbol, info=infos.get(symbol)) or 0.0)
-                   for symbol in members}
+        group_volumes = {}
+        for symbol in members:
+            volume = known_volumes.get(symbol)
+            if volume is None:
+                volume = get_avg_volume(symbol, info=infos.get(symbol))
+            group_volumes[symbol] = _num(volume) or 0.0
 
         def rank(symbol):
-            return (volumes[symbol],
+            return (group_volumes[symbol],
                     0 if "." not in symbol else -1,
                     -len(symbol),
                     -position[symbol])
@@ -666,10 +734,10 @@ def dedupe_tickers(ticker_list: Iterable[str],
                 "ticker": symbol,
                 "kept": winner,
                 "reason": "duplicate_company",
-                "name": names.get(symbol),
+                "name": resolved_names.get(symbol),
                 "normalized": key,
-                "avg_volume": volumes.get(symbol),
-                "kept_avg_volume": volumes.get(winner),
+                "avg_volume": group_volumes.get(symbol),
+                "kept_avg_volume": group_volumes.get(winner),
             })
 
     deduped = [symbol for symbol in ordered if symbol in keep]
@@ -691,6 +759,10 @@ _NAME_CASES = [
     ("Nestle S.A. (ADR)",              "nestle"),
     ("Constellation Software Inc.",    "constellation software"),
     ("Brookfield Corporation Class A", "brookfield"),
+    ("Clean Energy Fuels Corp.",        "clean energy fuels"),
+    ("Energy Fuels Inc.",               "energy fuels"),
+    ("Cloud Peak Energy Inc.",          "cloud peak energy"),
+    ("Clearway Energy, Inc. Cl. C",     "clearway energy"),
     ("",                               ""),
 ]
 
