@@ -23,6 +23,9 @@ How the pull is shaped:
     a downstream problem. Sorting is alphabetical by ticker throughout.
 
 Output: <stocks>\data\candidates.json (see write_candidates for the schema).
+An empty result set is written like any other - no matches is a legitimate
+market state. Every partition failing is not, and leaves the previous file
+alone (see total_failure).
 
 Setup:
     pip install yfinance curl_cffi requests
@@ -295,6 +298,21 @@ def to_candidate(symbol: str, quote: dict, sector: Optional[str]) -> dict:
     }
 
 
+def total_failure(stats: list, candidates: list) -> bool:
+    """True when nothing came back and every partition errored out - i.e. the
+    run failed, as opposed to the market simply having no matches."""
+    return bool(stats) and not candidates and all(s["failed"] for s in stats)
+
+
+def previous_run_stamp(output_path: Path) -> Optional[str]:
+    """generated_at of the file already on disk, for the abort message."""
+    try:
+        with open(output_path, "r", encoding="utf-8") as f:
+            return json.load(f).get("generated_at")
+    except Exception:
+        return None
+
+
 def write_candidates(candidates: list,
                      query_params: dict,
                      dropped: list,
@@ -355,6 +373,9 @@ def parse_args(argv=None):
                         help=f"page cap per partition (default {DEFAULT_MAX_PAGES}, {PAGE_SIZE} rows each)")
     parser.add_argument("--no-dedupe", action="store_true",
                         help="skip dual-class/cross-listing dedupe")
+    parser.add_argument("--force-write", action="store_true",
+                        help="write the output file even if every partition failed "
+                             "(default: keep the previous file and exit 1)")
     parser.add_argument("--refresh", action="store_true",
                         help="ignore cached screen pages and refetch")
     parser.add_argument("--output", type=Path, default=OUTPUT_PATH,
@@ -461,8 +482,6 @@ def main(argv=None) -> int:
         "partitions": stats,
     }
 
-    output_path = write_candidates(candidates, query_params, dropped, args.output)
-
     incomplete = [s for s in stats if s["failed"] or s["truncated"]]
     print(f"\nraw tickers:  {len(symbols)}")
     print(f"candidates:   {len(candidates)}")
@@ -470,6 +489,24 @@ def main(argv=None) -> int:
     if incomplete:
         print(f"incomplete:   {len(incomplete)} partition(s) truncated or failed "
               f"(see query_params.partitions)")
+
+    # A market with nothing in it is a real state and gets written like any
+    # other. Every partition failing is not: that is the network, not the
+    # market, and overwriting a good universe with an empty one would break
+    # the pipeline for a reason that has nothing to do with stocks.
+    if total_failure(stats, candidates) and args.output.exists() and not args.force_write:
+        previous = previous_run_stamp(args.output)
+        print(f"\nABORT: all {len(stats)} partition(s) failed - this is a fetch failure, "
+              f"not an empty market.")
+        print(f"       kept the existing {args.output}"
+              + (f" (generated {previous})" if previous else "")
+              + " instead of emptying it.")
+        print("       rerun when the network is back, or pass --force-write to "
+              "overwrite it with an empty universe.")
+        return 1
+
+    output_path = write_candidates(candidates, query_params, dropped, args.output)
+
     if not candidates:
         # Legitimate market state, not an error: the file is still written.
         print("note: zero candidates matched - wrote an empty candidate list")
