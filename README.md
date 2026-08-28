@@ -52,3 +52,32 @@ pythonw.exe dashboard_widget.py   # launch the widget (startup shortcut target)
 | Greed index | CNN Fear & Greed (score, zone gauge, Δ vs. yesterday) |
 | Sector analysis | S&P 500 + TSX sector ETFs, 1-day change, diverging bars |
 | News | Market RSS feeds, newest first, click to open |
+
+## ETF evaluator
+
+`etf.py` is a standalone CLI (not part of the widget) that scores a single
+ETF across seven dimensions — cost, liquidity, structure, risk, income,
+performance, concentration — with type-aware weights.
+
+```
+python etf.py SPY
+python etf.py XIC.TO      # exchange suffix skips the disambiguation probe
+python etf.py             # interactive
+```
+
+What the score means: it grades **how well a fund implements its own
+category** (fees against peers, liquidity, index fidelity, concentration).
+It does not say whether that category belongs in your portfolio.
+
+Dimensions are scored only where Yahoo actually supplies the data. Weights
+are renormalized over what was measured and the report prints a coverage
+figure; below 55% coverage no composite is emitted, so a fund with thin
+data reads as *unmeasured* rather than *mediocre*.
+
+`test_etf.py` is an offline regression suite — it reconstructs yfinance's
+data shapes and synthesises price series with known analytic answers, so it
+needs no network:
+
+```
+python test_etf.py
+```
