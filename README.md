@@ -13,10 +13,20 @@ Two-piece desktop dashboard:
   spawns `collector.py` as a subprocess via `CollectorRunner` — that is the
   intended refresh mechanism.
 
+## Market data layer
+
+- **`market_data.py`** — shared fetch layer for the stocks scripts. Owns the
+  HTTP session, the on-disk JSON cache (`cache\financials`, `cache\prices`, `cache\screener`),
+  the retry/backoff policy and ticker identity resolution. **Nothing else
+  should call yfinance directly** — import `get_info`, `get_price_history`,
+  `get_avg_volume`, `cached_screener` or `dedupe_tickers` from here. Network
+  failures come back as `None` (or a stale cache entry), never as an
+  exception. Run `py market_data.py` for its self-test.
+
 ## Setup
 
 ```
-pip install PyQt6 yfinance requests feedparser
+pip install PyQt6 yfinance requests feedparser curl_cffi
 ```
 
 Paths (cache location, notes dir, collector script) are configured at the top
