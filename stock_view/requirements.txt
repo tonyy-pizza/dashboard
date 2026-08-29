@@ -1,0 +1,27 @@
+# stock_view — interactive view over the stocks scan pipeline's output.
+#
+#   pip install -r requirements.txt
+
+# --- the dashboard itself ---------------------------------------------------
+# 1.49 is the floor: width="stretch" on st.dataframe / st.plotly_chart replaced
+# use_container_width there.
+streamlit>=1.49
+# 2.1 is the floor: Styler.map replaced the deprecated Styler.applymap there.
+pandas>=2.1
+plotly>=5.18
+numpy>=1.24
+
+# --- the pipeline's own dependencies ----------------------------------------
+# Only needed for the position sizing simulator and the optional price
+# sparkline. The simulator imports sizing_scale() and apply_reduction() from
+# position_sizer.py instead of re-deriving them, and importing position_sizer
+# pulls in market_data.py, which imports yfinance at module load.
+#
+# Nothing here is used to make a network call except get_price_history(), which
+# only runs when you press the button on the drill-down's Price history tab.
+#
+# On the machine that runs the scan these are already installed, and pip will
+# just confirm them. Drop these four lines if you only want the JSON views.
+yfinance
+curl_cffi
+requests
