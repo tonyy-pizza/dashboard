@@ -1234,7 +1234,8 @@ class EventDialog(QDialog):
             scaler.font(body_family, theme.CAPTION_PX, register=flag)
             layout.addWidget(flag)
 
-        for name, value in (("where", self._event.get("location")),
+        for name, value in (("calendar", self._event.get("calendar")),
+                            ("where", self._event.get("location")),
                             ("from", self._event.get("organizer")),
                             ("with", self._guests())):
             if value:
@@ -1466,6 +1467,8 @@ class WeekGrid(QWidget):
             if event.get("end"):
                 span += f"–{event['end']}"
             parts.append(span)
+        if event.get("calendar"):
+            parts.append(str(event["calendar"]))
         if event.get("location"):
             parts.append(str(event["location"]))
         if event_status(event) == "CANCELLED":

@@ -40,6 +40,47 @@ py collector.py            # populate/refresh cache.json
 pythonw.exe dashboard_widget.py   # launch the widget (startup shortcut target)
 ```
 
+## Calendars
+
+The calendar panel is built from published iCal (`.ics`) addresses — no OAuth,
+no app registration, no tokens. **One address covers exactly one calendar**,
+never a whole account. That is why a shared calendar that sits happily in your
+Google Calendar sidebar does not appear on the dashboard: the sidebar is a view
+over many calendars, the feed is one of them. Each calendar you want shown
+needs its own address listed alongside the others.
+
+List them one per line in `calendar_url.txt` (gitignored — these URLs grant
+read access to the calendar), optionally naming each one:
+
+```
+# one calendar per line; "Label = URL" to name it
+Personal = https://calendar.google.com/calendar/ical/…/private-…/basic.ics
+Family   = https://calendar.google.com/calendar/ical/…/private-…/basic.ics
+https://outlook.office365.com/owa/calendar/…/reachcalendar.ics
+```
+
+Events from every feed merge into one grid. An invite that lands on both your
+own and a shared calendar is drawn once, and the label shows in the event
+popup under `calendar`. If one feed is unreachable the others still render —
+the panel reports the failure instead of going blank.
+
+Where to find each address:
+
+| Calendar | Where |
+|---|---|
+| One you own (Google) | Settings → *Settings for my calendars* → the calendar → Integrate calendar → **Secret address in iCal format** |
+| Shared, owned by someone else | Google shows **no** secret address for it. Ask the owner for theirs (it is per-calendar, not per-account), or have them tick *Make available to public* and use the public iCal address |
+| Outlook / Exchange | Settings → Calendar → Shared calendars → *Publish a calendar* → *Can view all details* → copy the link ending `.ics` |
+
+Check what the dashboard can actually see:
+
+```
+py calendar_feed.py
+```
+
+It fetches each configured feed in turn, reports per-calendar event counts,
+prints this week day by day, and never prints the secret part of a URL.
+
 ## Panels
 
 | Panel | Data source |

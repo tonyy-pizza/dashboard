@@ -1,24 +1,33 @@
-"""Calendar — read-only week view built from a published iCal URL.
+"""Calendar — read-only week view built from published iCal URLs.
 
 The grid runs Sunday→Saturday and pages a few weeks either side of today.
 
 No OAuth, no consent screen, no credentials.json/token.json, no google-* or
-msal packages. The collector fetches one .ics file over HTTPS and parses it,
+msal packages. The collector fetches each .ics file over HTTPS and parses it,
 which works with any provider that publishes a private iCal address.
 
-Point this straight at the calendar that owns the events. Every extra hop
-(Outlook → Google → here) adds its own refresh delay and its own chance of
-pointing at the wrong calendar, because a provider's iCal address always
-covers exactly ONE calendar — never a whole account, whatever the provider's
-web UI overlays on screen.
+A provider's iCal address always covers exactly ONE calendar — never a whole
+account, whatever the provider's web UI overlays on screen. That is why a
+shared calendar sitting happily in your Google Calendar sidebar does NOT
+appear in your own calendar's feed: the sidebar is a view over many
+calendars, the feed is one of them.
+
+So every calendar you want on the dashboard needs its own address, and they
+are listed together — see ICAL_URLS below and SHARED_SETUP_STEPS for the
+shared-calendar case. Events are merged into one grid and de-duplicated, so
+an invite that lands on both your own and a shared calendar is drawn once.
+
+Point each address straight at the calendar that owns the events. Every extra
+hop (Outlook → Google → here) adds its own refresh delay and its own chance of
+pointing at the wrong calendar.
 
 For an Outlook/Exchange work calendar that means publishing it directly:
 see SETUP_STEPS. Publishing is not the same as connecting an app — there is
 no app registration, no consent and no token involved, just a URL.
 
-Paste your feed URL into ICAL_URL below. Anyone holding that URL can read your
-calendar, so if this folder is a git repo, prefer the sidecar file instead:
-put the URL on the first line of calendar_url.txt, which is gitignored.
+Anyone holding one of these URLs can read that calendar, so if this folder is
+a git repo, prefer the sidecar file: put one feed per line in
+calendar_url.txt, which is gitignored.
 
 Runs inside collector.py so the widget keeps its single data source
 (cache.json) and its no-polling contract: the widget never fetches anything.
@@ -35,7 +44,14 @@ import requests
 
 from paths import ICAL_URL_PATH
 
-# ── Paste your secret iCal address here ──────────────────────────────
+# ── Paste your secret iCal addresses here, one per calendar ──────────
+# Either a bare URL or ("Label", "URL") — the label is what the event
+# popup shows under "calendar", so name them the way you think of them.
+ICAL_URLS = [
+    # ("Personal", "https://calendar.google.com/calendar/ical/…/basic.ics"),
+    # ("Family",   "https://calendar.google.com/calendar/ical/…/basic.ics"),
+]
+# Single-feed setups that predate ICAL_URLS keep working untouched.
 ICAL_URL = "PASTE_YOUR_SECRET_ICAL_URL_HERE"
 # ─────────────────────────────────────────────────────────────────────
 
@@ -46,7 +62,7 @@ SETUP_STEPS = [
     "under 'Publish a calendar' pick the work calendar, permission "
     "'Can view all details', then Publish",
     "copy the ICS link (the one ending .ics — not the HTML link)",
-    f"paste it as ICAL_URL in calendar_feed.py, or into {ICAL_URL_PATH}",
+    f"add it to ICAL_URLS in calendar_feed.py, or as a line in {ICAL_URL_PATH}",
 ]
 
 # Kept for the Google route. Its address covers one calendar only, so it has
@@ -55,7 +71,22 @@ SETUP_STEPS = [
 GOOGLE_SETUP_STEPS = [
     "Google Calendar → Settings → click the calendar holding the events",
     "scroll to 'Integrate calendar' → copy 'Secret address in iCal format'",
-    f"paste it as ICAL_URL in calendar_feed.py, or into {ICAL_URL_PATH}",
+    f"add it to ICAL_URLS in calendar_feed.py, or as a line in {ICAL_URL_PATH}",
+]
+
+# A calendar someone else owns is the awkward case: Google only offers a
+# secret address for calendars YOU own, so for a calendar merely shared with
+# you that row is simply absent from Integrate calendar. Hence the fork.
+SHARED_SETUP_STEPS = [
+    "if YOU own the shared calendar: Google Calendar → Settings → pick it "
+    "under 'Settings for my calendars' → Integrate calendar → copy "
+    "'Secret address in iCal format'",
+    "if SOMEONE ELSE owns it: that page offers no secret address, so either "
+    "ask the owner to send you theirs (it is per-calendar, not per-account), "
+    "or have them tick 'Make available to public' and use the public iCal "
+    "address instead",
+    f"add the address as its own line in {ICAL_URL_PATH} — one calendar per "
+    "line, optionally as 'Label = URL'",
 ]
 
 PIP_HINT = "pip install icalendar recurring-ical-events"
@@ -117,33 +148,85 @@ def _ical_modules():
     return icalendar, recurring_ical_events
 
 
+class Feed:
+    """One calendar: where to fetch it, and what to call it on screen."""
+
+    def __init__(self, url, label="", source="", text=None):
+        self.url = url
+        self.label = label
+        self.source = source
+        self.text = text  # pre-fetched .ics, used by the tests and check()
+
+    def __repr__(self):
+        return f"Feed({self.label!r}, {mask_url(self.url)!r})"
+
+
+def _clean_url(candidate) -> str:
+    """A pasted address, normalised. webcal:// is rewritten to https:// —
+    some calendar UIs hand out the URL in that form and requests can't fetch
+    it. Raises if it is set but unusable."""
+    url = (candidate or "").strip().strip('"').strip("'")
+    if not url or PLACEHOLDER in url:
+        return ""
+    if url.startswith("webcal://"):
+        url = "https://" + url[len("webcal://"):]
+    if not url.startswith(("http://", "https://")):
+        # Only the scheme is safe to echo. The rest of the line ends up in
+        # cache.json and on screen, and a mistyped scheme is no reason to
+        # print the secret part of an otherwise valid address.
+        head = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:?/*", url)
+        raise CalendarSetupNeeded(
+            f"calendar URL doesn't start with https:// (got "
+            f"{(head.group(0) if head else url[:8]) or '?'}…)")
+    return url
+
+
+def resolve_feeds():
+    """Every configured calendar, in the order they were listed.
+
+    ICAL_URLS and ICAL_URL both feed in, then the sidecar file, so a setup
+    that only ever set ICAL_URL keeps working and can grow a second calendar
+    by adding one line to calendar_url.txt.
+
+    Duplicates are dropped: the same address listed twice would otherwise
+    draw every one of its events twice.
+    """
+    feeds, seen = [], set()
+    for url, label, source in _configured_entries():
+        url = _clean_url(url)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        feeds.append(Feed(url, label, source))
+    if not feeds:
+        raise CalendarSetupNeeded("no iCal URL set yet")
+    return feeds
+
+
+def _configured_entries():
+    """(url, label, source) from each place a calendar can be configured."""
+    here = "ICAL_URLS in calendar_feed.py"
+    for entry in ICAL_URLS or []:
+        if isinstance(entry, (tuple, list)):
+            label, url = (list(entry) + ["", ""])[:2] if len(entry) >= 2 else ("", entry[0])
+            yield url, str(label or "").strip(), here
+        else:
+            yield entry, "", here
+    yield ICAL_URL, "", "ICAL_URL in calendar_feed.py"
+    for label, url in _entries_from_file():
+        yield url, label, str(ICAL_URL_PATH)
+
+
 def resolve_url() -> str:
-    """The feed URL from ICAL_URL, else the first usable line of
-    calendar_url.txt. webcal:// is rewritten to https:// — some calendar UIs
-    hand out the URL in that form and requests can't fetch it."""
+    """The first configured feed URL. Kept for callers that predate
+    multi-calendar support."""
     return resolve_url_with_source()[0]
 
 
 def resolve_url_with_source():
     """(url, where it came from) — the diagnostic wants to name the source."""
-    sources = ((ICAL_URL, "ICAL_URL in calendar_feed.py"),
-               (_url_from_file(), str(ICAL_URL_PATH)))
-    for candidate, source in sources:
-        url = (candidate or "").strip().strip('"').strip("'")
-        if not url or PLACEHOLDER in url:
-            continue
-        if url.startswith("webcal://"):
-            url = "https://" + url[len("webcal://"):]
-        if not url.startswith(("http://", "https://")):
-            # Only the scheme is safe to echo. The rest of the line ends up in
-            # cache.json and on screen, and a mistyped scheme is no reason to
-            # print the secret part of an otherwise valid address.
-            head = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:?/*", url)
-            raise CalendarSetupNeeded(
-                f"calendar URL doesn't start with https:// (got "
-                f"{(head.group(0) if head else url[:8]) or '?'}…)")
-        return url, source
-    raise CalendarSetupNeeded("no iCal URL set yet")
+    first = resolve_feeds()[0]
+    return first.url, first.source
 
 
 # Path segments that name the service rather than identify the calendar.
@@ -171,16 +254,26 @@ def mask_url(url: str) -> str:
     return host + "/".join(segments)
 
 
-def _url_from_file():
+def _entries_from_file():
+    """(label, url) per usable line of the sidecar file.
+
+    One calendar per line, blank lines and #comments ignored. A line may be
+    a bare URL or 'Label = URL'; the split only counts when the '=' comes
+    before the scheme, since a URL's query string is full of them.
+    """
     try:
         text = Path(ICAL_URL_PATH).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
-        return ""
+        return
     for line in text.splitlines():
         line = line.strip()
-        if line and not line.startswith("#"):
-            return line
-    return ""
+        if not line or line.startswith("#"):
+            continue
+        label, sep, rest = line.partition("=")
+        if sep and "://" not in label:
+            yield label.strip(), rest.strip()
+        else:
+            yield "", line
 
 
 def scrub(message, url: str) -> str:
@@ -253,34 +346,73 @@ def collect_calendar(today=None, ics_text=None, tz=None) -> dict:
 
     try:
         icalendar, recurring_ical_events = _ical_modules()
-        if ics_text is None:
-            ics_text = fetch_ics(resolve_url())
-        calendar = icalendar.Calendar.from_ical(ics_text)
-        # between() expands RRULEs into real occurrences and applies EXDATE
-        # and RECURRENCE-ID overrides; the end is exclusive, hence +1 day.
-        occurrences = recurring_ical_events.of(calendar).between(
-            first_day, last_day + dt.timedelta(days=1))
-        in_feed = len(calendar.walk("VEVENT"))
+        feeds = _feeds_for_run(ics_text)
     except CalendarSetupNeeded as e:
         print(f"[calendar] Setup needed: {e}")
         payload.update(error=str(e), needs_setup=True, setup_steps=SETUP_STEPS)
         return payload
-    except Exception as e:
-        print(f"[calendar] Failed: {e}")
-        payload.update(error=str(e))
-        return payload
 
     by_date = {day["date"]: day["events"]
                for week in weeks for day in week["days"]}
-    for occurrence in list(occurrences)[:MAX_EVENTS]:
-        for date_key, event in _spread_event(occurrence, first_day, last_day, tz):
-            if date_key in by_date:
+    # One event invited to both your own and a shared calendar arrives once
+    # per feed with the same UID. Draw it once, credited to the first feed
+    # that carried it.
+    seen = set()
+    in_feed = 0
+    summaries, failures = [], []
+
+    for feed in feeds:
+        try:
+            text = feed.text if feed.text is not None else fetch_ics(feed.url)
+            calendar = icalendar.Calendar.from_ical(text)
+            # between() expands RRULEs into real occurrences and applies
+            # EXDATE and RECURRENCE-ID overrides; the end is exclusive,
+            # hence +1 day.
+            occurrences = recurring_ical_events.of(calendar).between(
+                first_day, last_day + dt.timedelta(days=1))
+            count = len(calendar.walk("VEVENT"))
+        except Exception as e:
+            # One unreachable calendar must not blank the others: record it
+            # and carry on, so a shared feed going stale still leaves your
+            # own week on screen.
+            message = scrub(e, feed.url)
+            print(f"[calendar] {feed.label or mask_url(feed.url)} failed: {message}")
+            failures.append({"calendar": feed.label, "error": str(message)})
+            continue
+
+        in_feed += count
+        drawn = 0
+        for occurrence in list(occurrences)[:MAX_EVENTS]:
+            key_base = _text(occurrence.get("UID"))
+            for date_key, event in _spread_event(
+                    occurrence, first_day, last_day, tz, feed.label):
+                if date_key not in by_date:
+                    continue
+                key = (key_base or event["summary"], date_key,
+                       event["start"] or "all-day")
+                if key in seen:
+                    continue
+                seen.add(key)
                 by_date[date_key].append(event)
+                drawn += 1
+        summaries.append({"calendar": feed.label, "events_in_feed": count,
+                          "events_drawn": drawn})
 
     for events in by_date.values():
         events.sort(key=lambda e: (not e["all_day"], e["start"] or ""))
 
     payload["events_in_feed"] = in_feed
+    payload["feeds"] = summaries
+    if failures:
+        payload["feed_errors"] = failures
+
+    if not summaries:
+        # Every feed failed — there is nothing on screen, so this is an error
+        # rather than a notice.
+        payload["error"] = "; ".join(
+            f"{f['calendar'] or 'calendar'}: {f['error']}" for f in failures)
+        return payload
+
     if not in_feed:
         # A feed that parses but holds nothing is almost always the address of
         # the wrong calendar — and without this the panel would draw a week of
@@ -290,12 +422,37 @@ def collect_calendar(today=None, ics_text=None, tz=None) -> dict:
         payload.update(needs_setup=True, setup_steps=SETUP_STEPS,
                        notice="that address is a valid feed but holds no "
                               "events — most likely the wrong calendar")
+    elif failures:
+        payload["notice"] = (
+            f"{len(failures)} of {len(feeds)} calendars could not be read — "
+            f"the rest are up to date")
 
     this_week = sum(len(day["events"]) for day in payload["days"])
     print(f"[calendar] OK — {this_week} events this week, "
           f"{sum(len(v) for v in by_date.values())} across "
-          f"{len(weeks)} weeks ({in_feed} in the feed)")
+          f"{len(weeks)} weeks ({in_feed} in {len(summaries)} "
+          f"calendar{'s' if len(summaries) != 1 else ''})")
     return payload
+
+
+def _feeds_for_run(ics_text):
+    """The feeds this run should read.
+
+    `ics_text` short-circuits the network for the tests and the diagnostic:
+    pass one .ics string, or a list of strings / (label, string) pairs.
+    """
+    if ics_text is None:
+        return resolve_feeds()
+    if isinstance(ics_text, str):
+        return [Feed("", "", "(supplied)", text=ics_text)]
+    feeds = []
+    for entry in ics_text:
+        if isinstance(entry, (tuple, list)):
+            label, text = entry
+        else:
+            label, text = "", entry
+        feeds.append(Feed("", str(label or ""), "(supplied)", text=text))
+    return feeds
 
 
 def _empty_week(start) -> dict:
@@ -308,7 +465,7 @@ def _empty_week(start) -> dict:
     }
 
 
-def _spread_event(occurrence, first_day, last_day, tz=None):
+def _spread_event(occurrence, first_day, last_day, tz=None, calendar_label=""):
     """One occurrence → (iso date, event dict) per day it covers inside the
     window. All-day events carry an exclusive DTEND, so a Fri→Mon event ends
     on the Sunday. Timed events are listed on the day they start."""
@@ -322,6 +479,7 @@ def _spread_event(occurrence, first_day, last_day, tz=None):
     # Everything the detail popup shows. The grid only reads summary/start,
     # so the rest rides along untouched until someone clicks.
     details = {
+        "calendar": calendar_label,
         "summary": _text(occurrence.get("SUMMARY")) or "(no title)",
         "location": _text(occurrence.get("LOCATION")),
         "description": _clean_description(_text(occurrence.get("DESCRIPTION"))),
@@ -487,35 +645,52 @@ def check() -> int:
     Walks the same three steps the collector does — find the URL, fetch it,
     parse it — and says which one broke. Never prints the URL itself.
     """
-    print("checking the calendar feed\n")
+    print("checking the calendar feeds\n")
 
     try:
-        url, source = resolve_url_with_source()
+        feeds = resolve_feeds()
     except CalendarSetupNeeded as e:
         print(f"  url ..... NOT SET ({e})\n")
         print("  no URL to test. Publish the calendar that owns the events:")
         for i, step in enumerate(SETUP_STEPS, 1):
             print(f"    {i}. {step}")
         return 1
-    print(f"  url ..... found in {source}")
-    print(f"            {mask_url(url)}")
 
-    try:
-        ics_text = fetch_ics(url)
-    except Exception as e:
-        print(f"  fetch ... FAILED — {e}\n")
-        print("  " + _fetch_advice(str(e), url))
+    print(f"  found ... {len(feeds)} calendar{'s' if len(feeds) != 1 else ''}")
+    fetched, failed = [], 0
+    for feed in feeds:
+        name = feed.label or _provider(feed.url)
+        print(f"\n  [{name}] from {feed.source}")
+        print(f"    url ..... {mask_url(feed.url)}")
+        try:
+            ics_text = fetch_ics(feed.url)
+        except Exception as e:
+            failed += 1
+            print(f"    fetch ... FAILED — {e}")
+            print("    " + _fetch_advice(str(e), feed.url).replace("\n  ", "\n    "))
+            continue
+        print(f"    fetch ... ok, {len(ics_text) / 1024:.1f} KB from "
+              f"{_provider(feed.url)}")
+        fetched.append((feed.label, ics_text))
+
+    if not fetched:
+        print("\n  Nothing could be fetched.")
         return 1
-    print(f"  fetch ... ok, {len(ics_text) / 1024:.1f} KB from {_provider(url)}")
+    print()
 
-    payload = collect_calendar(ics_text=ics_text)
+    payload = collect_calendar(ics_text=fetched)
     if payload.get("error"):
         print(f"  parse ... FAILED — {payload['error']}")
         return 1
 
+    for summary in payload.get("feeds", []):
+        print(f"  parse ... {summary['calendar'] or 'calendar'}: "
+              f"{summary['events_in_feed']} events in the feed, "
+              f"{summary['events_drawn']} drawn in the window")
+
     total = payload.get("events_in_feed", 0)
     this_week = sum(len(day["events"]) for day in payload["days"])
-    print(f"  parse ... ok, {total} events in the feed, "
+    print(f"            {total} events across all feeds, "
           f"{this_week} in the week of {payload['week_start']}")
     weeks = payload.get("weeks") or []
     if weeks:
@@ -527,8 +702,7 @@ def check() -> int:
     for day in payload["days"]:
         events = day["events"] or []
         listed = ", ".join(
-            (e["summary"] if e["all_day"] else f"{e['start']} {e['summary']}")
-            for e in events) or "—"
+            _describe(e) for e in events) or "—"
         print(f"    {day['date']}  {listed}")
 
     if not total:
@@ -539,7 +713,7 @@ def check() -> int:
         for i, step in enumerate(SETUP_STEPS, 1):
             print(f"    {i}. {step}")
     elif not this_week:
-        print("\n  The feed parsed but has nothing in the current week. That's "
+        print("\n  The feeds parsed but have nothing in the current week. That's "
               "normal for a\n  quiet week — check a date above against the "
               "calendar to be sure it's the\n  right one.")
     elif all(e["summary"].lower() in ("busy", "(no title)")
@@ -547,11 +721,29 @@ def check() -> int:
         print("\n  Every event came through titled 'Busy' — the calendar was "
               "published as\n  availability only. Re-publish it with 'Can view "
               "all details' to get titles.")
+    elif failed:
+        print(f"\n  {failed} calendar(s) above failed; the rest are fine. The panel "
+              f"shows what\n  could be read rather than going blank.")
     else:
-        print("\n  Feed is fine. If the panel still looks stale, the collector "
+        print("\n  Feeds are fine. If the panel still looks stale, the collector "
               "isn't running:\n  run `py collector.py` and check the last sync "
               "time in the dashboard.")
+
+    if len(feeds) == 1:
+        print("\n  Only one calendar is configured. A shared calendar is a "
+              "SEPARATE calendar —\n  it shows in your Google sidebar but is not "
+              "in this feed, and needs its own\n  address added alongside:")
+        for i, step in enumerate(SHARED_SETUP_STEPS, 1):
+            print(f"    {i}. {step}")
     return 0
+
+
+def _describe(event) -> str:
+    """'09:30 Standup [Family]' — the calendar tag only when there is one, so
+    single-calendar output reads exactly as it did before."""
+    text = (event["summary"] if event["all_day"]
+            else f"{event['start']} {event['summary']}")
+    return f"{text} [{event['calendar']}]" if event.get("calendar") else text
 
 
 def _provider(url: str) -> str:
